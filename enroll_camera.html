@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <title>Daftar Wajah - Kamera</title>
+
+  <!-- Font -->
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap" rel="stylesheet">
+
+  <style>
+    body {
+      font-family: "Poppins", Arial, sans-serif;
+      background: #f5f6fa; 
+      display: flex;
+      justify-content: center;
+      padding-top: 40px;
+      color: #333;
+    }
+
+    .container {
+      background: #fff;
+      width: 380px;
+      padding: 24px;
+      border-radius: 18px;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.08);
+    }
+
+    h2 {
+      margin-bottom: 6px;
+      font-weight: 600;
+      text-align: center;
+      color: #2d3436;
+    }
+
+    .subtitle {
+      font-size: 12px;
+      color: #636e72;
+      text-align: center;
+      margin-bottom: 14px;
+    }
+
+    label {
+      font-weight: 500;
+      margin-bottom: 4px;
+      display: block;
+    }
+
+    input {
+      width: 100%;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid #dfe6e9;
+      margin-bottom: 12px;
+      font-size: 14px;
+    }
+
+    video {
+      width: 100%;
+      border-radius: 14px;
+      border: 2px solid #dfe6e9;
+      margin-bottom: 10px;
+    }
+
+    #instruction {
+      background: #dfe6e9;
+      padding: 10px;
+      border-radius: 10px;
+      margin-bottom: 10px;
+      font-size: 14px;
+      text-align: center;
+      font-weight: 500;
+    }
+
+    button {
+      width: 100%;
+      padding: 12px;
+      background: #0984e3;
+      border: none;
+      border-radius: 12px;
+      color: white;
+      font-size: 15px;
+      cursor: pointer;
+      transition: 0.2s;
+      margin-bottom: 8px;
+    }
+
+    button:hover:not(:disabled) {
+      background: #74b9ff;
+    }
+
+    button:disabled {
+      background: #b2bec3;
+      cursor: default;
+    }
+
+    .btn-secondary {
+      background: #636e72;
+    }
+    .btn-secondary:hover:not(:disabled) {
+      background: #b2bec3;
+    }
+
+    .log-title {
+      margin-top: 15px;
+      margin-bottom: 6px;
+      font-weight: 600;
+    }
+
+    .log-box {
+      background: #f3f3f3;
+      padding: 14px;
+      border-radius: 12px;
+      max-height: 220px;
+      overflow-y: auto;
+      border-left: 4px solid #0984e3;
+      white-space: pre-wrap;
+      font-size: 13px;
+    }
+
+    .badge-done {
+      background: #dff9fb;
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 12px;
+      display: inline-block;
+      margin-bottom: 6px;
+      color: #0984e3;
+      font-weight: 500;
+    }
+
+    .badge-warning {
+      background: #ffeaa7;
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 12px;
+      display: inline-block;
+      margin-bottom: 6px;
+      color: #d35400;
+      font-weight: 500;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h2>Daftar Wajah (Enrollment)</h2>
+    <div class="subtitle">Ambil beberapa pose untuk menyimpan wajah karyawan</div>
+
+    <label>ID Karyawan</label>
+    <input id="empId" placeholder="contoh: emp001">
+
+    <label>Nama</label>
+    <input id="empName" placeholder="contoh: Rafika">
+
+    <video id="video" autoplay playsinline></video>
+
+    <div id="instruction"></div>
+
+    <button id="captureBtn">Ambil Foto</button>
+    <button id="finishBtn" class="btn-secondary" disabled>Selesai Pendaftaran</button>
+
+    <div id="statusBadge" style="display:none;"></div>
+
+    <div class="log-title">Log:</div>
+    <div class="log-box" id="logBox">Belum ada foto diambil.</div>
+
+    <canvas id="canvas" style="display:none;"></canvas>
+  </div>
+
+  <script>
+    // Minimal jumlah pose yang wajib berhasil
+    const MIN_SUCCESS = 4;
+
+    const steps = [
+      "Step 1: Lihat lurus ke kamera, lalu klik Ambil Foto.",
+      "Step 2: Hadap sedikit ke kanan, lalu klik Ambil Foto.",
+      "Step 3: Hadap sedikit ke kiri, lalu klik Ambil Foto.",
+      "Step 4: Tersenyum tipis, lalu klik Ambil Foto."
+    ];
+
+    let currentStep = 0;
+    let successCount = 0;
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const captureBtn = document.getElementById("captureBtn");
+    const finishBtn = document.getElementById("finishBtn");
+    const instruction = document.getElementById("instruction");
+    const logBox = document.getElementById("logBox");
+    const statusBadge = document.getElementById("statusBadge");
+
+    instruction.textContent = steps[currentStep];
+
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        video.srcObject = stream;
+      } catch (err) {
+        alert("Gagal akses kamera: " + err.message);
+      }
+    }
+
+    startCamera();
+
+    captureBtn.addEventListener("click", () => {
+      const empId = document.getElementById("empId").value.trim();
+      const empName = document.getElementById("empName").value.trim();
+
+      if (!empId || !empName) {
+        alert("Isi dulu ID Karyawan & Nama");
+        return;
+      }
+
+      // ambil frame dari kamera
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      canvas.toBlob(async (blob) => {
+        const formData = new FormData();
+        formData.append("employee_id", empId);
+        formData.append("name", empName);
+        formData.append("image", blob, "capture_step_" + currentStep + ".jpg");
+
+        captureBtn.disabled = true;
+        captureBtn.textContent = "Mengirim ke server...";
+
+        try {
+          const res = await fetch("http://127.0.0.1:8000/register", {
+            method: "POST",
+            body: formData,
+          });
+
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            addLogFailure(
+              currentStep,
+              "Server mengembalikan error",
+              errData.detail || JSON.stringify(errData)
+            );
+            showWarning("Foto belum berhasil tersimpan. Ulangi step ini.");
+            return;
+          }
+
+          const data = await res.json();
+
+          if (data.status === "success" && data.data) {
+            const info = data.data;
+            successCount++;
+
+            if (logBox.textContent.startsWith("Belum ada foto")) {
+              logBox.textContent = "";
+            }
+
+            logBox.textContent +=
+              `Step ${currentStep + 1} selesai ✅\n` +
+              `• ID     : ${info.employee_id}\n` +
+              `• Nama   : ${info.name}\n` +
+              `• Total foto tersimpan: ${info.num_embeddings}\n\n`;
+
+            currentStep++;
+            if (currentStep < steps.length) {
+              instruction.textContent = steps[currentStep];
+              clearStatus();
+            } else {
+              instruction.textContent =
+                "Semua pose sudah dicoba. Jika data sudah sesuai, klik 'Selesai Pendaftaran'.";
+              showDoneOrWarning();
+            }
+          } else {
+            addLogFailure(
+              currentStep,
+              "Response tidak sesuai format",
+              JSON.stringify(data)
+            );
+            showWarning("Foto tidak berhasil diproses. Ulangi step ini.");
+          }
+
+        } catch (err) {
+          addLogFailure(currentStep, "Error jaringan / fetch", err.message);
+          showWarning("Terjadi error jaringan. Ulangi step ini.");
+        } finally {
+          captureBtn.disabled = false;
+          captureBtn.textContent = "Ambil Foto";
+        }
+      }, "image/jpeg");
+    });
+
+    finishBtn.addEventListener("click", () => {
+      if (successCount >= MIN_SUCCESS) {
+        alert("Pendaftaran wajah selesai dan tersimpan. Anda akan diarahkan ke halaman pengecekan wajah.");
+        setTimeout(() => {
+          window.location.href = "camera_test.html";
+        }, 1000);
+      } else {
+        alert("Belum memenuhi jumlah foto yang berhasil. Ulangi pengambilan sampai semua step berhasil.");
+      }
+    });
+
+    function addLogFailure(stepIndex, reason, detail) {
+      if (logBox.textContent.startsWith("Belum ada foto")) {
+        logBox.textContent = "";
+      }
+      logBox.textContent +=
+        `Step ${stepIndex + 1} GAGAL ❌\n` +
+        `• Alasan : ${reason}\n` +
+        (detail ? `• Detail : ${detail}\n` : "") +
+        `• Silakan ulangi pengambilan untuk step ini.\n\n`;
+    }
+
+    function showWarning(msg) {
+      statusBadge.style.display = "inline-block";
+      statusBadge.className = "badge-warning";
+      statusBadge.textContent = "⚠ " + msg;
+    }
+
+    function clearStatus() {
+      statusBadge.style.display = "none";
+    }
+
+    function showDoneOrWarning() {
+      statusBadge.style.display = "inline-block";
+      if (successCount >= MIN_SUCCESS) {
+        statusBadge.className = "badge-done";
+        statusBadge.textContent = "✅ Semua pose berhasil terekam. Anda bisa klik 'Selesai Pendaftaran'.";
+        finishBtn.disabled = false;
+      } else {
+        statusBadge.className = "badge-warning";
+        statusBadge.textContent =
+          "⚠ Ada pose yang gagal diproses. Ulangi pengambilan sampai minimal " +
+          MIN_SUCCESS +
+          " foto berhasil.";
+        finishBtn.disabled = true;
+      }
+    }
+  </script>
+</body>
+</html>

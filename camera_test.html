@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <title>Face Recognition - Kamera (HRIS)</title>
+
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap" rel="stylesheet">
+
+  <style>
+    body {
+      font-family: "Poppins", Arial, sans-serif;
+      background: #f5f6fa;
+      display: flex;
+      justify-content: center;
+      padding-top: 40px;
+      color: #333;
+    }
+
+    .container {
+      background: #fff;
+      width: 380px;
+      padding: 24px;
+      border-radius: 18px;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.08);
+      text-align: center;
+    }
+
+    h2 {
+      margin-bottom: 6px;
+      font-weight: 600;
+      color: #2d3436;
+    }
+
+    .subtitle {
+      font-size: 12px;
+      color: #636e72;
+      margin-bottom: 14px;
+    }
+
+    video {
+      width: 100%;
+      border-radius: 14px;
+      border: 2px solid #dfe6e9;
+      margin-bottom: 12px;
+    }
+
+    button {
+      width: 100%;
+      padding: 12px;
+      margin-top: 4px;
+      background: #0984e3;
+      border: none;
+      border-radius: 12px;
+      color: white;
+      font-size: 15px;
+      cursor: pointer;
+      transition: 0.2s;
+    }
+
+    button:hover:not(:disabled) {
+      background: #74b9ff;
+    }
+
+    button:disabled {
+      background: #b2bec3;
+      cursor: default;
+    }
+
+    .result-card {
+      margin-top: 16px;
+      padding: 14px;
+      border-radius: 12px;
+      text-align: left;
+      font-size: 14px;
+    }
+
+    .result-success {
+      background: #dff9e9;
+      border-left: 4px solid #00b894;
+    }
+
+    .result-fail {
+      background: #ffeae9;
+      border-left: 4px solid #d63031;
+    }
+
+    .result-title {
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .result-detail {
+      margin-left: 8px;
+      line-height: 1.4;
+    }
+
+    .json-raw {
+      margin-top: 10px;
+      background: #f3f3f3;
+      padding: 10px;
+      border-radius: 10px;
+      font-size: 11px;
+      text-align: left;
+      max-height: 160px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Face Recognition Kamera</h2>
+    <div class="subtitle">Gunakan untuk cek wajah / absensi HRIS</div>
+
+    <video id="video" autoplay playsinline></video>
+    <button id="captureBtn">Ambil Foto & Cek Wajah</button>
+
+    <div id="resultBox" class="result-card" style="display:none;"></div>
+
+    <div class="json-raw" id="jsonBox">Belum ada request.</div>
+
+    <canvas id="canvas" style="display:none;"></canvas>
+  </div>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const captureBtn = document.getElementById("captureBtn");
+    const resultBox = document.getElementById("resultBox");
+    const jsonBox = document.getElementById("jsonBox");
+
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        video.srcObject = stream;
+      } catch (err) {
+        alert("Gagal akses kamera: " + err.message);
+      }
+    }
+
+    startCamera();
+
+    captureBtn.addEventListener("click", () => {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      canvas.toBlob(async (blob) => {
+        const formData = new FormData();
+        formData.append("image", blob, "capture.jpg");
+
+        captureBtn.disabled = true;
+        captureBtn.textContent = "Mengirim ke server...";
+
+        try {
+          const res = await fetch("http://127.0.0.1:8000/recognize", {
+            method: "POST",
+            body: formData,
+          });
+
+          // kalau status HTTP bukan 2xx → lempar error dengan detail backend
+          if (!res.ok) {
+            const errBody = await res.json().catch(() => ({}));
+            const msg = errBody.detail || `HTTP Error ${res.status}`;
+            throw new Error(msg);
+          }
+
+          const data = await res.json();
+
+          // Tampilkan raw JSON (untuk debugging / pengujian)
+          jsonBox.textContent = JSON.stringify(data, null, 2);
+
+          // Tampilkan hasil user-friendly
+          resultBox.style.display = "block";
+
+          if (data.status === "success" && data.data) {
+            const info = data.data;
+
+            if (info.match) {
+              resultBox.className = "result-card result-success";
+              resultBox.innerHTML =
+                `<div class="result-title">✅ Wajah berhasil dikenali</div>` +
+                `<div class="result-detail">
+                   • ID Karyawan : <b>${info.employee_id}</b><br>
+                   • Nama        : <b>${info.name}</b><br>
+                   • Jarak Embedding : ${info.distance?.toFixed ? info.distance.toFixed(3) : info.distance} (threshold ${info.threshold})
+                 </div>`;
+            } else {
+              resultBox.className = "result-card result-fail";
+              const bestDist = info.best_distance;
+              resultBox.innerHTML =
+                `<div class="result-title">❌ Wajah belum terdaftar / tidak cocok</div>` +
+                `<div class="result-detail">
+                   • Alasan   : ${info.reason || "Tidak ada wajah cocok"}<br>
+                   • Jarak terbaik : ${
+                      typeof bestDist === "number"
+                        ? bestDist.toFixed(3)
+                        : bestDist
+                    } (threshold ${info.threshold})
+                 </div>`;
+            }
+          } else {
+            resultBox.className = "result-card result-fail";
+            resultBox.innerHTML =
+              `<div class="result-title">❌ Terjadi kesalahan</div>` +
+              `<div class="result-detail">
+                 Response tidak sesuai format yang diharapkan.
+               </div>`;
+          }
+
+        } catch (err) {
+          resultBox.style.display = "block";
+          resultBox.className = "result-card result-fail";
+          resultBox.innerHTML =
+            `<div class="result-title">❌ Error koneksi / server</div>` +
+            `<div class="result-detail">
+               ${err.message}
+             </div>`;
+          jsonBox.textContent = "Error: " + err.message;
+        } finally {
+          captureBtn.disabled = false;
+          captureBtn.textContent = "Ambil Foto & Cek Wajah";
+        }
+      }, "image/jpeg");
+    });
+  </script>
+</body>
+</html>
