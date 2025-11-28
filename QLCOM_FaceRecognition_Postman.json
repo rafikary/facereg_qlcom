@@ -1,0 +1,127 @@
+{
+  "info": {
+    "name": "QLCOM Face Recognition API",
+    "_postman_id": "qlcom-face-recognition-api-001",
+    "description": "Postman Collection untuk QLCOM HRIS Face Recognition API.\n\nBerisi endpoint:\n- POST /register   → daftar wajah karyawan\n- POST /recognize  → verifikasi wajah karyawan\n- GET  /users      → list karyawan terdaftar\n- DELETE /user/{employee_id} → hapus data wajah karyawan\n\nGunakan variable {{base_url}} untuk mengganti server (lokal / production).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Register Face",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "employee_id",
+              "value": "TEST123",
+              "type": "text",
+              "description": "ID unik karyawan, contoh: RAFIKA123"
+            },
+            {
+              "key": "name",
+              "value": "Testing User",
+              "type": "text",
+              "description": "Nama karyawan"
+            },
+            {
+              "key": "image",
+              "type": "file",
+              "src": [],
+              "description": "File foto wajah (jpg/png)"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/register",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "register"
+          ]
+        },
+        "description": "Daftar / enroll wajah karyawan baru.\n\nForm-data:\n- employee_id (text)\n- name (text)\n- image (file)\n\nResponse success:\n{\n  \"status\": \"success\",\n  \"data\": {\n    \"employee_id\": \"RAFIKA123\",\n    \"name\": \"Rafika\",\n    \"num_embeddings\": 4\n  }\n}"
+      }
+    },
+    {
+      "name": "Recognize Face",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "image",
+              "type": "file",
+              "src": [],
+              "description": "File foto wajah (capture dari kamera / file jpg/png)"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/recognize",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "recognize"
+          ]
+        },
+        "description": "Verifikasi wajah karyawan.\n\nForm-data:\n- image (file)\n\nResponse (match):\n{\n  \"status\": \"success\",\n  \"data\": {\n    \"match\": true,\n    \"employee_id\": \"RAFIKA123\",\n    \"name\": \"Rafika\",\n    \"distance\": 2.85,\n    \"threshold\": 3.5,\n    \"confidence\": \"medium\"\n  }\n}\n\nResponse (no match):\n{\n  \"status\": \"success\",\n  \"data\": {\n    \"match\": false,\n    \"reason\": \"Tidak ada wajah cocok.\",\n    \"best_distance\": 6.01,\n    \"threshold\": 3.5\n  }\n}"
+      }
+    },
+    {
+      "name": "List Users",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/users",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "users"
+          ]
+        },
+        "description": "Melihat daftar user yang sudah terdaftar beserta jumlah foto/embedding.\n\nResponse contoh:\n{\n  \"status\": \"success\",\n  \"data\": [\n    {\n      \"employee_id\": \"RAFIKA123\",\n      \"name\": \"Rafika\",\n      \"num_embeddings\": 4\n    },\n    {\n      \"employee_id\": \"LINYI001\",\n      \"name\": \"Lin Yi\",\n      \"num_embeddings\": 3\n    }\n  ]\n}"
+      }
+    },
+    {
+      "name": "Delete User",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/user/{{employee_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "user",
+            "{{employee_id}}"
+          ],
+          "variable": [
+            {
+              "key": "employee_id",
+              "value": "TEST123",
+              "description": "Employee ID yang akan dihapus"
+            }
+          ]
+        },
+        "description": "Menghapus data wajah 1 karyawan dari database.\n\nPath param:\n- employee_id\n\nResponse jika berhasil:\n{\n  \"status\": \"success\",\n  \"data\": {\n    \"deleted\": true,\n    \"employee_id\": \"TEST123\"\n  }\n}\n\nResponse jika tidak ditemukan (404):\n{\n  \"detail\": \"User tidak ditemukan\"\n}"
+      }
+    }
+  ]
+}
