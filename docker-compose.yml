@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  facereg_service:
+    build: .
+    container_name: facereg_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./faces:/app/faces
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+
+
+volumes:
+  facesdb:
