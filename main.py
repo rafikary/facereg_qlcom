@@ -1,7 +1,7 @@
 # main.py – API HRIS Face Recognition
 
+from typing import List
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import engine
@@ -16,16 +16,19 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ================== ROOT (Homepage API) ==================
+# ================== STARTUP ==================
+@app.on_event("startup")
+async def startup_event():
+    engine.load_liveness_model()
+# ============================================
 
 @app.get("/")
 def root():
@@ -35,14 +38,12 @@ def root():
         "endpoints": {
             "register": "/register",
             "recognize": "/recognize",
+            "recognize_multi": "/recognize_multi",
             "list_users": "/users",
             "delete_user": "/user/{employee_id}",
             "docs_swagger": "/docs"
         }
     }
-
-
-# ================== REGISTER ==================
 
 @app.post("/register")
 async def register(
@@ -57,9 +58,6 @@ async def register(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
-# ================== RECOGNIZE ==================
-
 @app.post("/recognize")
 async def recognize(image: UploadFile = File(...)):
     try:
@@ -69,12 +67,18 @@ async def recognize(image: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
-# ================== LIST USERS ==================
+# OPTIONAL: multi-frame voting
+@app.post("/recognize_multi")
+async def recognize_multi(images: List[UploadFile] = File(...)):
+    try:
+        imgs = [await f.read() for f in images]
+        result = engine.recognize_face_multi(imgs)
+        return {"status": "success", "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/users")
 async def list_users():
-
     if not os.path.exists(DB_PATH):
         return {"status": "success", "data": []}
 
@@ -91,9 +95,6 @@ async def list_users():
     ]
 
     return {"status": "success", "data": users}
-
-
-# ================== DELETE USER ==================
 
 @app.delete("/user/{employee_id}")
 async def delete_user(employee_id: str):

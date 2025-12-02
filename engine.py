@@ -1,14 +1,62 @@
-# engine.py - ArcFace + MTCNN (DeepFace 0.0.96 compatible)
-
+# engine.py - ArcFace + MTCNN (DeepFace 0.0.96 compatible) + Liveness (OpenVINO anti-spoof-mn3 + optional DeepFace anti_spoofing)
 import json
 import os
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
+
 import numpy as np
 import cv2
 from deepface import DeepFace
+import openvino as ov
 
 DB_PATH = "faces_db.json"
-DETECTOR_BACKEND = "mtcnn"  
+DETECTOR_BACKEND = "mtcnn"
+
+# ================== LIVENESS CONFIG ==================
+LIVENESS_MODEL_PATH = "models/anti-spoof-mn3.onnx"
+
+# OpenVINO score band
+OV_PASS = 0.60           # target "aman"
+OV_UNCERTAIN_LOW = 0.45  # bawah ini -> nanggung / minta ulang
+OV_STRONG_SPOOF = 0.30   # bawah ini -> spoof kuat
+
+# DeepFace antispoof score band 
+DF_PASS = 0.80
+DF_STRONG_LIVE = 0.92
+DF_STRONG_SPOOF = 0.55
+
+# Quality gate (biar webcam jelek tidak langsung dituduh spoof)
+MIN_FACE_AREA = 90 * 90
+MIN_FACE_CONF = 0.90
+MIN_BLUR_VAR = 35.0
+MIN_BRIGHT = 35.0
+MAX_BRIGHT = 225.0
+
+# Optional: enforce liveness on enrollment
+ENROLL_REQUIRE_LIVENESS = True
+
+# OpenVINO globals
+_OV_CORE: Optional[ov.Core] = None
+_OV_COMPILED = None
+_OV_OUTPUT = None
+
+
+def load_liveness_model() -> None:
+    """Call once at startup. If model missing => bypass liveness."""
+    global _OV_CORE, _OV_COMPILED, _OV_OUTPUT
+
+    if not os.path.exists(LIVENESS_MODEL_PATH):
+        print(f"[LIVENESS] Model not found: {LIVENESS_MODEL_PATH} (bypass)")
+        _OV_CORE = None
+        _OV_COMPILED = None
+        _OV_OUTPUT = None
+        return
+
+    _OV_CORE = ov.Core()
+    model = _OV_CORE.read_model(LIVENESS_MODEL_PATH)
+    _OV_COMPILED = _OV_CORE.compile_model(model, "CPU")
+    _OV_OUTPUT = _OV_COMPILED.output(0)
+    print(f"[LIVENESS] Loaded: {LIVENESS_MODEL_PATH}")
+
 
 # ================== UTIL DB ==================
 
@@ -30,18 +78,325 @@ def bytes_to_bgr_image(image_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError("Gagal membaca gambar. Pastikan file jpg/png/jpeg valid.")
+        raise ValueError("Gagal membaca gambar. Pastikan jpg/png/jpeg valid.")
     return img
+
+
+def _safe_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _expand_bbox(x: int, y: int, w: int, h: int, pct: int, W: int, H: int) -> Tuple[int, int, int, int]:
+    # expand percentage applies to width/height total (split to both sides)
+    dx = int((w * pct / 100.0) / 2.0)
+    dy = int((h * pct / 100.0) / 2.0)
+    x1 = max(0, x - dx)
+    y1 = max(0, y - dy)
+    x2 = min(W, x + w + dx)
+    y2 = min(H, y + h + dy)
+    return x1, y1, x2, y2
+
+
+def _preprocess_ov(face_bgr_u8: np.ndarray) -> np.ndarray:
+    """Return NCHW float32 1x3x128x128 with correct BGR mean/scale."""
+    face = cv2.resize(face_bgr_u8, (128, 128), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+    # RGB mean/scale from model zoo, reorder -> BGR
+    mean_bgr = np.array([107.8395, 119.5950, 151.2405], dtype=np.float32)  # B,G,R
+    scale_bgr = np.array([55.0035, 56.4570, 63.0105], dtype=np.float32)    # B,G,R
+    face = (face - mean_bgr) / scale_bgr
+
+    inp = np.transpose(face, (2, 0, 1))[None, ...]  # (1,3,128,128)
+    return inp
+
+
+def _infer_ov(face_bgr_u8: np.ndarray) -> Tuple[float, float]:
+    """Return (p_real, p_spoof). Handles softmax if needed."""
+    inp = _preprocess_ov(face_bgr_u8)
+    out = _OV_COMPILED([inp])[_OV_OUTPUT]  # (1,2)
+    out = np.array(out).reshape(2)
+    p0, p1 = float(out[0]), float(out[1])
+
+    s = p0 + p1
+    if not (0.9 <= s <= 1.1) or p0 < 0 or p1 < 0 or p0 > 2 or p1 > 2:
+        ex = np.exp(out - np.max(out))
+        sm = ex / (np.sum(ex) + 1e-9)
+        p0, p1 = float(sm[0]), float(sm[1])
+
+    return p0, p1
+
+
+def _quality_metrics(face_bgr_u8: np.ndarray) -> Dict[str, float]:
+    gray = cv2.cvtColor(face_bgr_u8, cv2.COLOR_BGR2GRAY)
+    blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    bright = float(gray.mean())
+    return {"blur_var": blur_var, "bright": bright}
+
+
+# ================== LIVENESS ==================
+
+def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        is_live: bool,
+        reason: ok|spoof_detected|liveness_uncertain|quality_low|bypass,
+        prob_real: float, prob_spoof: float,  (OpenVINO mean)
+        df_is_real: bool|None, df_score: float|None,
+        model: str,
+        debug: str
+      }
+    """
+    # Lazy load (optional)
+    if _OV_COMPILED is None and os.path.exists(LIVENESS_MODEL_PATH):
+        try:
+            load_liveness_model()
+        except Exception:
+            pass
+
+    if _OV_COMPILED is None:
+        return {
+            "is_live": True,
+            "reason": "bypass",
+            "prob_real": 1.0,
+            "prob_spoof": 0.0,
+            "df_is_real": None,
+            "df_score": None,
+            "model": "anti-spoof-mn3(+deepface)",
+            "debug": "bypass (OpenVINO model not loaded)"
+        }
+
+    img_bgr = bytes_to_bgr_image(image_bytes)
+    H, W = img_bgr.shape[:2]
+
+    # 1) Extract face once (try WITH anti_spoofing; if fail, fallback without)
+    meta = None
+    face_bgr = None
+    df_is_real = None
+    df_score = None
+
+    try:
+        faces = DeepFace.extract_faces(
+            img_path=img_bgr,
+            detector_backend=DETECTOR_BACKEND,
+            enforce_detection=True,
+            align=False,
+            expand_percentage=20,
+            color_face="bgr",
+            anti_spoofing=True,  # needs torch
+        )
+        meta = faces[0]
+        face_bgr = meta["face"]
+        df_is_real = meta.get("is_real", None)
+        df_score = _safe_float(meta.get("antispoof_score", None), None)
+    except Exception as e:
+        # fallback: still do OpenVINO only
+        try:
+            faces = DeepFace.extract_faces(
+                img_path=img_bgr,
+                detector_backend=DETECTOR_BACKEND,
+                enforce_detection=True,
+                align=False,
+                expand_percentage=20,
+                color_face="bgr",
+            )
+            meta = faces[0]
+            face_bgr = meta["face"]
+        except Exception as e2:
+            return {
+                "is_live": False,
+                "reason": "quality_low",
+                "prob_real": 0.0,
+                "prob_spoof": 1.0,
+                "df_is_real": None,
+                "df_score": None,
+                "model": "anti-spoof-mn3(+deepface)",
+                "debug": f"crop fail: df={e} | fallback={e2}"
+            }
+
+    if face_bgr is None:
+        return {
+            "is_live": False,
+            "reason": "quality_low",
+            "prob_real": 0.0,
+            "prob_spoof": 1.0,
+            "df_is_real": None,
+            "df_score": None,
+            "model": "anti-spoof-mn3(+deepface)",
+            "debug": "empty face"
+        }
+
+    # face_bgr could be float 0..1
+    face_np = np.array(face_bgr)
+    if float(face_np.max()) <= 1.0:
+        face_u8 = (face_np * 255.0).clip(0, 255).astype(np.uint8)
+    else:
+        face_u8 = face_np.clip(0, 255).astype(np.uint8)
+
+    # 2) Quality gate
+    fa = (meta or {}).get("facial_area", {}) or {}
+    x = int(fa.get("x", 0) or 0)
+    y = int(fa.get("y", 0) or 0)
+    w = int(fa.get("w", 0) or 0)
+    h = int(fa.get("h", 0) or 0)
+    conf = _safe_float((meta or {}).get("confidence", 1.0), 1.0)
+
+    qm = _quality_metrics(face_u8)
+    blur_var = qm["blur_var"]
+    bright = qm["bright"]
+    area = w * h
+
+    low_conf = conf is not None and conf < MIN_FACE_CONF
+    too_small = area < MIN_FACE_AREA
+    too_blur = blur_var < MIN_BLUR_VAR
+    too_dark = bright < MIN_BRIGHT
+    too_bright = bright > MAX_BRIGHT
+
+    if low_conf or too_small or too_blur or too_dark or too_bright:
+        return {
+            "is_live": False,
+            "reason": "quality_low",
+            "prob_real": 0.0,
+            "prob_spoof": 1.0,
+            "df_is_real": df_is_real,
+            "df_score": df_score,
+            "model": "anti-spoof-mn3(+deepface)",
+            "debug": f"quality_low conf={conf:.2f} area={w}x{h} blur={blur_var:.1f} bright={bright:.1f}"
+        }
+
+    # 3) OpenVINO multi-crop inference from bbox (stabilizer + include background)
+    # If bbox missing, just use face_u8
+    ov_scores = []
+    ov_spoofs = []
+
+    if w > 0 and h > 0:
+        for pct in (0, 20, 40):
+            x1, y1, x2, y2 = _expand_bbox(x, y, w, h, pct, W, H)
+            crop = img_bgr[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            p_real, p_spoof = _infer_ov(crop.astype(np.uint8))
+            ov_scores.append(p_real)
+            ov_spoofs.append(p_spoof)
+    else:
+        p_real, p_spoof = _infer_ov(face_u8)
+        ov_scores.append(p_real)
+        ov_spoofs.append(p_spoof)
+
+    if not ov_scores:
+        return {
+            "is_live": False,
+            "reason": "quality_low",
+            "prob_real": 0.0,
+            "prob_spoof": 1.0,
+            "df_is_real": df_is_real,
+            "df_score": df_score,
+            "model": "anti-spoof-mn3(+deepface)",
+            "debug": "ov inference failed (no crops)"
+        }
+
+    ov_real = float(np.mean(ov_scores))
+    ov_spoof = float(np.mean(ov_spoofs))
+
+    # 4) Decision logic (reduce false reject + reduce replay pass)
+    # Hard spoof conditions
+    if ov_real <= OV_STRONG_SPOOF:
+        return {
+            "is_live": False,
+            "reason": "spoof_detected",
+            "prob_real": ov_real,
+            "prob_spoof": ov_spoof,
+            "df_is_real": df_is_real,
+            "df_score": df_score,
+            "model": "anti-spoof-mn3(+deepface)",
+            "debug": f"FAIL(ov_strong_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
+        }
+
+    if df_is_real is False and df_score is not None and df_score <= DF_STRONG_SPOOF:
+        return {
+            "is_live": False,
+            "reason": "spoof_detected",
+            "prob_real": ov_real,
+            "prob_spoof": ov_spoof,
+            "df_is_real": df_is_real,
+            "df_score": df_score,
+            "model": "anti-spoof-mn3(+deepface)",
+            "debug": f"FAIL(df_strong_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score:.3f}"
+        }
+
+    # Pass conditions
+    if df_is_real is None:
+        # No DF module available -> rely on OpenVINO only
+        if ov_real >= OV_PASS:
+            return {
+                "is_live": True,
+                "reason": "ok",
+                "prob_real": ov_real,
+                "prob_spoof": ov_spoof,
+                "df_is_real": None,
+                "df_score": None,
+                "model": "anti-spoof-mn3",
+                "debug": f"PASS(ov_only) ov_real={ov_real:.3f}"
+            }
+        # uncertain band
+        return {
+            "is_live": False,
+            "reason": "liveness_uncertain",
+            "prob_real": ov_real,
+            "prob_spoof": ov_spoof,
+            "df_is_real": None,
+            "df_score": None,
+            "model": "anti-spoof-mn3",
+            "debug": f"UNCERTAIN(ov_only) ov_real={ov_real:.3f}"
+        }
+
+    # DF available: require "mostly agree" (reduce replay pass)
+    if df_is_real is True and df_score is not None:
+        if (ov_real >= OV_PASS and df_score >= DF_PASS):
+            return {
+                "is_live": True,
+                "reason": "ok",
+                "prob_real": ov_real,
+                "prob_spoof": ov_spoof,
+                "df_is_real": True,
+                "df_score": df_score,
+                "model": "anti-spoof-mn3+deepface",
+                "debug": f"PASS(both) ov_real={ov_real:.3f} df_score={df_score:.3f}"
+            }
+
+        # allow DF super-strong to rescue weak webcam, but still not too low OV
+        if (df_score >= DF_STRONG_LIVE and ov_real >= OV_UNCERTAIN_LOW):
+            return {
+                "is_live": True,
+                "reason": "ok",
+                "prob_real": ov_real,
+                "prob_spoof": ov_spoof,
+                "df_is_real": True,
+                "df_score": df_score,
+                "model": "anti-spoof-mn3+deepface",
+                "debug": f"PASS(df_rescue) ov_real={ov_real:.3f} df_score={df_score:.3f}"
+            }
+
+    # otherwise -> uncertain (ask recapture)
+    return {
+        "is_live": False,
+        "reason": "liveness_uncertain" if ov_real >= OV_UNCERTAIN_LOW else "spoof_detected",
+        "prob_real": ov_real,
+        "prob_spoof": ov_spoof,
+        "df_is_real": df_is_real,
+        "df_score": df_score,
+        "model": "anti-spoof-mn3+deepface",
+        "debug": f"FAIL/UNCERTAIN ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
+    }
 
 
 # ================== ARCFace Embedding ==================
 
 def get_arcface_embedding(image_bytes: bytes) -> np.ndarray:
-    """
-    Mengambil embedding wajah (512 dim) menggunakan ArcFace + MTCNN.
-    """
     img = bytes_to_bgr_image(image_bytes)
-
     try:
         reps = DeepFace.represent(
             img_path=img,
@@ -59,38 +414,9 @@ def get_arcface_embedding(image_bytes: bytes) -> np.ndarray:
     return np.array(emb, dtype=np.float32)
 
 
-# ================== REGISTER ==================
+# ================== MATCH CORE (NO LIVENESS) ==================
 
-def register_face(employee_id: str, name: str, image_bytes: bytes) -> Dict[str, Any]:
-    db = load_db()
-
-    emb = get_arcface_embedding(image_bytes)
-    emb_list = emb.tolist()
-
-    if employee_id in db:
-        db[employee_id]["embeddings"].append(emb_list)
-        db[employee_id]["name"] = name
-    else:
-        db[employee_id] = {
-            "name": name,
-            "embeddings": [emb_list]
-        }
-
-    save_db(db)
-
-    return {
-        "employee_id": employee_id,
-        "name": name,
-        "num_embeddings": len(db[employee_id]["embeddings"])
-    }
-
-# ================== RECOGNIZE ==================
-
-def recognize_face(image_bytes: bytes, threshold: float = 3.5) -> Dict[str, Any]:
-    """
-    Mencocokkan wajah dengan database.
-    threshold default 3.5 (disesuaikan untuk masker + kamera laptop).
-    """
+def _recognize_no_liveness(image_bytes: bytes, threshold: float = 3.5) -> Dict[str, Any]:
     db = load_db()
     if not db:
         return {"match": False, "reason": "Database kosong."}
@@ -101,26 +427,21 @@ def recognize_face(image_bytes: bytes, threshold: float = 3.5) -> Dict[str, Any]
     best_name: Optional[str] = None
     best_dist: float = 999.0
 
-    # cari jarak terdekat
     for emp_id, data in db.items():
         name = data["name"]
         for emb in data["embeddings"]:
             emb_vec = np.array(emb, dtype=np.float32)
-            dist = np.linalg.norm(query_emb - emb_vec)
-
+            dist = float(np.linalg.norm(query_emb - emb_vec))
             if dist < best_dist:
                 best_dist = dist
                 best_id = emp_id
                 best_name = name
 
-    # ---------- MATCH ----------
     if best_id is not None and best_dist < threshold:
-
-        # Confidence level (berbasis eksperimen: masker, low light)
         if best_dist < 2.0:
-            confidence = "high"      # sangat mirip
+            confidence = "high"
         elif best_dist < 3.5:
-            confidence = "medium"    # mirip, pengaruh masker/cahaya
+            confidence = "medium"
         else:
             confidence = "low"
 
@@ -129,16 +450,128 @@ def recognize_face(image_bytes: bytes, threshold: float = 3.5) -> Dict[str, Any]
             "employee_id": best_id,
             "name": best_name,
             "distance": float(best_dist),
-            "threshold": threshold,
+            "threshold": float(threshold),
             "confidence": confidence
         }
 
-    # ---------- TIDAK MATCH ----------
     return {
         "match": False,
         "reason": "Tidak ada wajah cocok.",
         "best_distance": float(best_dist),
-        "threshold": threshold
+        "threshold": float(threshold)
+    }
+
+
+# ================== REGISTER ==================
+
+def register_face(employee_id: str, name: str, image_bytes: bytes) -> Dict[str, Any]:
+    if ENROLL_REQUIRE_LIVENESS:
+        live = detect_spoof(image_bytes)
+        if not live["is_live"]:
+            raise ValueError(f"Enrollment ditolak ({live['reason']}): {live.get('debug')}")
+
+    db = load_db()
+    emb = get_arcface_embedding(image_bytes)
+    emb_list = emb.tolist()
+
+    if employee_id in db:
+        db[employee_id]["embeddings"].append(emb_list)
+        db[employee_id]["name"] = name
+    else:
+        db[employee_id] = {"name": name, "embeddings": [emb_list]}
+
+    save_db(db)
+    return {"employee_id": employee_id, "name": name, "num_embeddings": len(db[employee_id]["embeddings"])}
+
+
+# ================== RECOGNIZE (SINGLE) ==================
+
+def recognize_face(image_bytes: bytes, threshold: float = 3.5) -> Dict[str, Any]:
+    live = detect_spoof(image_bytes)
+
+    if not live["is_live"]:
+        return {
+            "match": False,
+            "liveness_ok": False,
+            "liveness_reason": live.get("reason"),
+            "liveness_prob_real": live.get("prob_real"),
+            "liveness_prob_spoof": live.get("prob_spoof"),
+            "liveness_df_is_real": live.get("df_is_real"),
+            "liveness_df_score": live.get("df_score"),
+            "liveness_model": live.get("model"),
+            "reason": live.get("reason", "spoof_detected"),
+            "debug_liveness": live.get("debug"),
+        }
+
+    rec = _recognize_no_liveness(image_bytes, threshold=threshold)
+    rec.update({
+        "liveness_ok": True,
+        "liveness_reason": live.get("reason"),
+        "liveness_prob_real": live.get("prob_real"),
+        "liveness_prob_spoof": live.get("prob_spoof"),
+        "liveness_df_is_real": live.get("df_is_real"),
+        "liveness_df_score": live.get("df_score"),
+        "liveness_model": live.get("model"),
+        "debug_liveness": live.get("debug"),
+    })
+    return rec
+
+
+# ================== RECOGNIZE (MULTI) ==================
+
+def recognize_face_multi(images_bytes: List[bytes], threshold: float = 3.5) -> Dict[str, Any]:
+    """
+    Vote across N frames:
+    - If >= ceil(N*0.6) frames pass liveness => accept, then recognize using best liveness frame.
+    - Else if any strong spoof => spoof_detected
+    - Else => liveness_uncertain
+    """
+    if not images_bytes:
+        return {"match": False, "liveness_ok": False, "reason": "quality_low", "debug_liveness": "no images"}
+
+    results = []
+    for b in images_bytes:
+        results.append(detect_spoof(b))
+
+    pass_count = sum(1 for r in results if r.get("is_live"))
+    n = len(results)
+    need = int(np.ceil(n * 0.6))
+
+    # pick best frame for recognition (highest ov real)
+    best_idx = int(np.argmax([_safe_float(r.get("prob_real"), 0.0) for r in results]))
+    best_live = results[best_idx]
+
+    if pass_count >= need:
+        rec = _recognize_no_liveness(images_bytes[best_idx], threshold=threshold)
+        rec.update({
+            "liveness_ok": True,
+            "liveness_reason": "ok",
+            "liveness_prob_real": best_live.get("prob_real"),
+            "liveness_prob_spoof": best_live.get("prob_spoof"),
+            "liveness_df_is_real": best_live.get("df_is_real"),
+            "liveness_df_score": best_live.get("df_score"),
+            "liveness_model": best_live.get("model"),
+            "debug_liveness": f"VOTE pass={pass_count}/{n}, best_idx={best_idx}, best={best_live.get('debug')}",
+            "frames": results,
+        })
+        return rec
+
+    # if any strong spoof_detected
+    if any(r.get("reason") == "spoof_detected" for r in results):
+        return {
+            "match": False,
+            "liveness_ok": False,
+            "reason": "spoof_detected",
+            "debug_liveness": f"VOTE fail pass={pass_count}/{n}",
+            "frames": results,
+        }
+
+    return {
+        "match": False,
+        "liveness_ok": False,
+        "reason": "liveness_uncertain",
+        "debug_liveness": f"VOTE uncertain pass={pass_count}/{n}",
+        "frames": results,
     }
 
 
@@ -146,11 +579,8 @@ def recognize_face(image_bytes: bytes, threshold: float = 3.5) -> Dict[str, Any]
 
 def delete_user(employee_id: str) -> Dict[str, Any]:
     db = load_db()
-
     if employee_id not in db:
         return {"deleted": False, "reason": "User tidak ditemukan"}
-
     del db[employee_id]
     save_db(db)
-
     return {"deleted": True, "employee_id": employee_id}

@@ -4,13 +4,12 @@
   <meta charset="UTF-8" />
   <title>Daftar Wajah - Kamera</title>
 
-  <!-- Font -->
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap" rel="stylesheet">
 
   <style>
     body {
       font-family: "Poppins", Arial, sans-serif;
-      background: #f5f6fa; 
+      background: #f5f6fa;
       display: flex;
       justify-content: center;
       padding-top: 40px;
@@ -19,7 +18,7 @@
 
     .container {
       background: #fff;
-      width: 380px;
+      width: 420px;
       padding: 24px;
       border-radius: 18px;
       box-shadow: 0 8px 20px rgba(0,0,0,0.08);
@@ -59,6 +58,7 @@
       border-radius: 14px;
       border: 2px solid #dfe6e9;
       margin-bottom: 10px;
+      background: #000;
     }
 
     #instruction {
@@ -110,7 +110,7 @@
       background: #f3f3f3;
       padding: 14px;
       border-radius: 12px;
-      max-height: 220px;
+      max-height: 240px;
       overflow-y: auto;
       border-left: 4px solid #0984e3;
       white-space: pre-wrap;
@@ -138,6 +138,8 @@
       color: #d35400;
       font-weight: 500;
     }
+
+    .muted { color:#636e72; font-size:12px; }
   </style>
 </head>
 
@@ -168,8 +170,17 @@
   </div>
 
   <script>
+    // ===================== CONFIG =====================
+    const API_BASE = "http://127.0.0.1:8000";
+
     // Minimal jumlah pose yang wajib berhasil
     const MIN_SUCCESS = 4;
+
+    // Stabilizer capture
+    const CAPTURE_DELAY_MS = 250; // tunggu auto exposure
+    const BURST_COUNT = 2;        // enroll cukup 2 frame (lebih cepat)
+    const BURST_GAP_MS = 120;
+    const DOWNSAMPLE_STEP = 4;
 
     const steps = [
       "Step 1: Lihat lurus ke kamera, lalu klik Ambil Foto.",
@@ -193,7 +204,13 @@
 
     async function startCamera() {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        });
         video.srcObject = stream;
       } catch (err) {
         alert("Gagal akses kamera: " + err.message);
@@ -202,106 +219,90 @@
 
     startCamera();
 
-    captureBtn.addEventListener("click", () => {
-      const empId = document.getElementById("empId").value.trim();
-      const empName = document.getElementById("empName").value.trim();
+    // ===================== HELPERS =====================
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-      if (!empId || !empName) {
-        alert("Isi dulu ID Karyawan & Nama");
-        return;
-      }
+    function computeMetricsFromCanvas(ctx, w, h) {
+      const img = ctx.getImageData(0, 0, w, h);
+      const d = img.data;
 
-      // ambil frame dari kamera
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      let sumB = 0;
+      let sumLap = 0, sumLap2 = 0;
+      let cnt = 0;
 
-      canvas.toBlob(async (blob) => {
-        const formData = new FormData();
-        formData.append("employee_id", empId);
-        formData.append("name", empName);
-        formData.append("image", blob, "capture_step_" + currentStep + ".jpg");
+      const step = DOWNSAMPLE_STEP;
 
-        captureBtn.disabled = true;
-        captureBtn.textContent = "Mengirim ke server...";
+      const lumAt = (x, y) => {
+        const i = (y * w + x) * 4;
+        const r = d[i], g = d[i+1], b = d[i+2];
+        return 0.299 * r + 0.587 * g + 0.114 * b;
+      };
 
-        try {
-          const res = await fetch("http://127.0.0.1:8000/register", {
-            method: "POST",
-            body: formData,
-          });
+      for (let y = 2; y < h - 2; y += step) {
+        for (let x = 2; x < w - 2; x += step) {
+          const c = lumAt(x, y);
+          const l = lumAt(x - 1, y);
+          const r = lumAt(x + 1, y);
+          const u = lumAt(x, y - 1);
+          const dn = lumAt(x, y + 1);
 
-          if (!res.ok) {
-            const errData = await res.json().catch(() => ({}));
-            addLogFailure(
-              currentStep,
-              "Server mengembalikan error",
-              errData.detail || JSON.stringify(errData)
-            );
-            showWarning("Foto belum berhasil tersimpan. Ulangi step ini.");
-            return;
-          }
+          const lap = (4 * c - l - r - u - dn);
 
-          const data = await res.json();
-
-          if (data.status === "success" && data.data) {
-            const info = data.data;
-            successCount++;
-
-            if (logBox.textContent.startsWith("Belum ada foto")) {
-              logBox.textContent = "";
-            }
-
-            logBox.textContent +=
-              `Step ${currentStep + 1} selesai ✅\n` +
-              `• ID     : ${info.employee_id}\n` +
-              `• Nama   : ${info.name}\n` +
-              `• Total foto tersimpan: ${info.num_embeddings}\n\n`;
-
-            currentStep++;
-            if (currentStep < steps.length) {
-              instruction.textContent = steps[currentStep];
-              clearStatus();
-            } else {
-              instruction.textContent =
-                "Semua pose sudah dicoba. Jika data sudah sesuai, klik 'Selesai Pendaftaran'.";
-              showDoneOrWarning();
-            }
-          } else {
-            addLogFailure(
-              currentStep,
-              "Response tidak sesuai format",
-              JSON.stringify(data)
-            );
-            showWarning("Foto tidak berhasil diproses. Ulangi step ini.");
-          }
-
-        } catch (err) {
-          addLogFailure(currentStep, "Error jaringan / fetch", err.message);
-          showWarning("Terjadi error jaringan. Ulangi step ini.");
-        } finally {
-          captureBtn.disabled = false;
-          captureBtn.textContent = "Ambil Foto";
+          sumB += c;
+          sumLap += lap; sumLap2 += lap * lap;
+          cnt++;
         }
-      }, "image/jpeg");
-    });
-
-    finishBtn.addEventListener("click", () => {
-      if (successCount >= MIN_SUCCESS) {
-        alert("Pendaftaran wajah selesai dan tersimpan. Anda akan diarahkan ke halaman pengecekan wajah.");
-        setTimeout(() => {
-          window.location.href = "camera_test.html";
-        }, 1000);
-      } else {
-        alert("Belum memenuhi jumlah foto yang berhasil. Ulangi pengambilan sampai semua step berhasil.");
       }
-    });
 
+      const bright = sumB / Math.max(1, cnt);
+      const meanLap = sumLap / Math.max(1, cnt);
+      const varLap = (sumLap2 / Math.max(1, cnt)) - (meanLap * meanLap);
+
+      let penalty = 0;
+      if (bright < 50) penalty += (50 - bright) * 2;
+      if (bright > 210) penalty += (bright - 210) * 2;
+
+      const score = varLap - penalty;
+      return { bright, varLap, score };
+    }
+
+    async function canvasToBlobPNG(canvasEl) {
+      return new Promise((resolve) => {
+        canvasEl.toBlob((blob) => resolve(blob), "image/png"); // <<< PNG lossless
+      });
+    }
+
+    async function captureBestFrameBlob() {
+      if (!video.videoWidth || !video.videoHeight) await sleep(200);
+
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+
+      canvas.width = w;
+      canvas.height = h;
+
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+      await sleep(CAPTURE_DELAY_MS);
+
+      let best = null;
+      for (let i = 0; i < BURST_COUNT; i++) {
+        ctx.drawImage(video, 0, 0, w, h);
+        const metrics = computeMetricsFromCanvas(ctx, w, h);
+        const blob = await canvasToBlobPNG(canvas);
+
+        const candidate = { blob, metrics };
+        if (!best || candidate.metrics.score > best.metrics.score) best = candidate;
+
+        await sleep(BURST_GAP_MS);
+      }
+
+      return best;
+    }
+
+    // ===================== UI HELPERS =====================
     function addLogFailure(stepIndex, reason, detail) {
-      if (logBox.textContent.startsWith("Belum ada foto")) {
-        logBox.textContent = "";
-      }
+      if (logBox.textContent.startsWith("Belum ada foto")) logBox.textContent = "";
       logBox.textContent +=
         `Step ${stepIndex + 1} GAGAL ❌\n` +
         `• Alasan : ${reason}\n` +
@@ -323,17 +324,101 @@
       statusBadge.style.display = "inline-block";
       if (successCount >= MIN_SUCCESS) {
         statusBadge.className = "badge-done";
-        statusBadge.textContent = "✅ Semua pose berhasil terekam. Anda bisa klik 'Selesai Pendaftaran'.";
+        statusBadge.textContent = "✅ Minimal foto berhasil tercapai. Klik 'Selesai Pendaftaran'.";
         finishBtn.disabled = false;
       } else {
         statusBadge.className = "badge-warning";
         statusBadge.textContent =
-          "⚠ Ada pose yang gagal diproses. Ulangi pengambilan sampai minimal " +
-          MIN_SUCCESS +
-          " foto berhasil.";
+          "⚠ Masih kurang. Pastikan tiap step berhasil sampai minimal " + MIN_SUCCESS + " foto.";
         finishBtn.disabled = true;
       }
     }
+
+    // ===================== ACTIONS =====================
+    captureBtn.addEventListener("click", async () => {
+      const empId = document.getElementById("empId").value.trim();
+      const empName = document.getElementById("empName").value.trim();
+
+      if (!empId || !empName) {
+        alert("Isi dulu ID Karyawan & Nama");
+        return;
+      }
+
+      captureBtn.disabled = true;
+      captureBtn.textContent = "Stabilisasi kamera...";
+
+      try {
+        const best = await captureBestFrameBlob();
+        captureBtn.textContent = "Mengirim ke server...";
+
+        const formData = new FormData();
+        formData.append("employee_id", empId);
+        formData.append("name", empName);
+        formData.append("image", best.blob, `capture_step_${currentStep}.png`);
+
+        const res = await fetch(`${API_BASE}/register`, {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          addLogFailure(
+            currentStep,
+            "Server mengembalikan error",
+            errData.detail || JSON.stringify(errData)
+          );
+          showWarning("Foto belum berhasil tersimpan. Ulangi step ini.");
+          return;
+        }
+
+        const data = await res.json();
+        if (data.status === "success" && data.data) {
+          const info = data.data;
+          successCount++;
+
+          if (logBox.textContent.startsWith("Belum ada foto")) logBox.textContent = "";
+
+          logBox.textContent +=
+            `Step ${currentStep + 1} selesai ✅\n` +
+            `• ID     : ${info.employee_id}\n` +
+            `• Nama   : ${info.name}\n` +
+            `• Total foto tersimpan: ${info.num_embeddings}\n` +
+            `• Frame metrics: bright=${best.metrics.bright.toFixed(1)} lap_var=${best.metrics.varLap.toFixed(1)}\n\n`;
+
+          currentStep++;
+          if (currentStep < steps.length) {
+            instruction.textContent = steps[currentStep];
+            clearStatus();
+          } else {
+            instruction.textContent =
+              "Semua pose sudah dicoba. Jika data sudah sesuai, klik 'Selesai Pendaftaran'.";
+            showDoneOrWarning();
+          }
+        } else {
+          addLogFailure(currentStep, "Response tidak sesuai format", JSON.stringify(data));
+          showWarning("Foto tidak berhasil diproses. Ulangi step ini.");
+        }
+
+      } catch (err) {
+        addLogFailure(currentStep, "Error jaringan / fetch", err.message);
+        showWarning("Terjadi error jaringan. Ulangi step ini.");
+      } finally {
+        captureBtn.disabled = false;
+        captureBtn.textContent = "Ambil Foto";
+      }
+    });
+
+    finishBtn.addEventListener("click", () => {
+      if (successCount >= MIN_SUCCESS) {
+        alert("Pendaftaran wajah selesai. Anda akan diarahkan ke halaman pengecekan wajah.");
+        setTimeout(() => {
+          window.location.href = "camera_test.html";
+        }, 700);
+      } else {
+        alert("Belum memenuhi jumlah foto yang berhasil. Ulangi pengambilan sampai minimal berhasil.");
+      }
+    });
   </script>
 </body>
 </html>
