@@ -162,7 +162,7 @@
     // ===================== CONFIG =====================
     const API_BASE = "http://127.0.0.1:8000";
     const CAPTURE_DELAY_MS = 250;  // tunggu auto exposure settle
-    const BURST_COUNT = 3;         // ambil 3 frame
+    const BURST_COUNT = 5;         // ambil 3 frame
     const BURST_GAP_MS = 120;      // jeda antar frame
     const DOWNSAMPLE_STEP = 4;     // hemat CPU saat hitung sharpness
 
@@ -204,7 +204,6 @@
       const d = img.data;
 
       let sumB = 0;
-      let sumL = 0, sumL2 = 0;
       let sumLap = 0, sumLap2 = 0;
       let cnt = 0;
 
@@ -229,7 +228,6 @@
           const lap = (4 * c - l - r - u - dn);
 
           sumB += c;
-          sumL += c; sumL2 += c * c;
           sumLap += lap; sumLap2 += lap * lap;
           cnt++;
         }
@@ -251,7 +249,7 @@
 
     async function canvasToBlobPNG(canvasEl) {
       return new Promise((resolve) => {
-        canvasEl.toBlob((blob) => resolve(blob), "image/png"); // <<< PNG (lossless)
+        canvasEl.toBlob((blob) => resolve(blob), "image/png"); // PNG (lossless)
       });
     }
 
@@ -295,35 +293,59 @@
       return (typeof n === "number" && isFinite(n)) ? n.toFixed(digits) : "-";
     }
 
+    // === UPDATED: tampilkan hasil match/no match dengan wording jelas ===
     function showResultCardSuccess(info) {
       resultBox.style.display = "block";
-      resultBox.className = "result-card result-success";
 
-      const liveOk = info.liveness_ok === true;
-      const pr = info.liveness_prob_real;
-      const ps = info.liveness_prob_spoof;
+      const reason = (info.reason || "").toLowerCase();
+      const isDbEmpty = reason.includes("database kosong");
 
-      let lines = "";
       if (info.match) {
-        lines += `• ID: <b>${info.employee_id}</b><br>`;
-        lines += `• Nama: <b>${info.name}</b><br>`;
-        lines += `• Distance: ${fmt(info.distance)} (thr ${info.threshold})<br>`;
-      } else {
-        lines += `• Status: <b>Tidak cocok / belum terdaftar</b><br>`;
-        if (info.best_distance !== undefined) {
-          lines += `• Best distance: ${fmt(info.best_distance)} (thr ${info.threshold})<br>`;
-        }
-        if (info.reason) lines += `• Reason: ${info.reason}<br>`;
+        resultBox.className = "result-card result-success";
+        resultBox.innerHTML =
+          `<div class="result-title">✅ Wajah dikenali</div>` +
+          `<div class="result-detail">
+            • ID: <b>${info.employee_id}</b><br>
+            • Nama: <b>${info.name}</b><br>
+            • Distance: ${fmt(info.distance)} (thr ${info.threshold})<br>
+            <div class="muted" style="margin-top:6px;">
+              Liveness: <b>OK</b> | prob_real: <b>${fmt(info.liveness_prob_real)}</b> | prob_spoof: <b>${fmt(info.liveness_prob_spoof)}</b>
+            </div>
+            ${info.liveness_model ? `<div class="muted">Model: ${info.liveness_model}</div>` : ""}
+            ${info.debug_liveness ? `<div class="muted mono">debug: ${info.debug_liveness}</div>` : ""}
+          </div>`;
+        return;
       }
 
-      lines += `• Liveness: <b>${liveOk ? "OK" : "FAIL"}</b><br>`;
-      lines += `• Liveness prob_real: <b>${fmt(pr)}</b> | prob_spoof: <b>${fmt(ps)}</b><br>`;
-      if (info.liveness_model) lines += `• Model: ${info.liveness_model}<br>`;
-      if (info.debug_liveness) lines += `<span class="muted mono">debug: ${info.debug_liveness}</span>`;
+      // No match but liveness ok
+      resultBox.className = "result-card result-fail";
+
+      if (isDbEmpty) {
+        resultBox.innerHTML =
+          `<div class="result-title">ℹ️ Belum ada data wajah</div>` +
+          `<div class="result-detail">
+            Database masih kosong. Silakan lakukan <b>pendaftaran wajah</b> terlebih dulu.<br>
+            <div class="muted" style="margin-top:6px;">
+              Liveness: <b>OK</b> | prob_real: <b>${fmt(info.liveness_prob_real)}</b> | prob_spoof: <b>${fmt(info.liveness_prob_spoof)}</b>
+            </div>
+            ${info.liveness_model ? `<div class="muted">Model: ${info.liveness_model}</div>` : ""}
+            ${info.debug_liveness ? `<div class="muted mono">debug: ${info.debug_liveness}</div>` : ""}
+          </div>`;
+        return;
+      }
 
       resultBox.innerHTML =
-        `<div class="result-title">✅ Liveness OK & proses selesai</div>` +
-        `<div class="result-detail">${lines}</div>`;
+        `<div class="result-title">❌ Wajah tidak dikenali</div>` +
+        `<div class="result-detail">
+          Wajah terdeteksi, tapi tidak cocok dengan data yang terdaftar.<br>
+          ${info.best_distance !== undefined ? `• Best distance: ${fmt(info.best_distance)} (thr ${info.threshold})<br>` : ""}
+          ${info.reason ? `• Info: ${info.reason}<br>` : ""}
+          <div class="muted" style="margin-top:6px;">
+            Liveness: <b>OK</b> | prob_real: <b>${fmt(info.liveness_prob_real)}</b> | prob_spoof: <b>${fmt(info.liveness_prob_spoof)}</b>
+          </div>
+          ${info.liveness_model ? `<div class="muted">Model: ${info.liveness_model}</div>` : ""}
+          ${info.debug_liveness ? `<div class="muted mono">debug: ${info.debug_liveness}</div>` : ""}
+        </div>`;
     }
 
     function showResultCardFail(msg, detailJson) {
@@ -373,20 +395,45 @@
           const extra = `\n\n[frame_metrics]\nbrightness=${m.bright.toFixed(1)}\nlap_var=${m.varLap.toFixed(1)}\nscore=${m.score.toFixed(1)}\n`;
           jsonBox.textContent += extra;
 
-          // kalau liveness fail -> tampilkan fail
+          // === UPDATED: mapping alasan liveness supaya jelas ===
           if (info.liveness_ok === false) {
-            const reason = info.reason || "spoof_detected";
-            showResultCardFail(
-              `<b>reason:</b> ${reason}<br>` +
-              `<b>prob_real:</b> ${fmt(info.liveness_prob_real)}<br>` +
-              `<b>prob_spoof:</b> ${fmt(info.liveness_prob_spoof)}<br>` +
-              `<b>model:</b> ${info.liveness_model || "-"}<br>` +
-              `<span class="muted mono">debug: ${info.debug_liveness || "-"}</span>`,
-              data
-            );
+            const r = (info.reason || info.liveness_reason || "spoof_detected");
+            const msgMap = {
+              spoof_detected: {
+                title: "⛔ Ditolak (indikasi spoof)",
+                detail: "Terindikasi bukan wajah live (misalnya foto/layar/galeri/print). Silakan coba ulang dengan wajah asli di depan kamera."
+              },
+              liveness_uncertain: {
+                title: "⚠️ Liveness belum yakin",
+                detail: "Sistem belum yakin ini live karena hasil liveness tidak konsisten. Silakan ambil ulang 3–5 detik dengan posisi stabil."
+              },
+              quality_low: {
+                title: "⚠️ Kualitas gambar kurang",
+                detail: "Kualitas gambar kurang bagus (gelap/terlalu terang/blur/wajah terlalu kecil). Silakan ulang dengan pencahayaan lebih baik dan wajah lebih dekat."
+              }
+            };
+
+            const m2 = msgMap[r] || msgMap["liveness_uncertain"];
+
+            resultBox.style.display = "block";
+            resultBox.className = "result-card result-fail";
+            resultBox.innerHTML =
+              `<div class="result-title">${m2.title}</div>` +
+              `<div class="result-detail">
+                ${m2.detail}<br><br>
+                • reason: <b>${r}</b><br>
+                • prob_real: <b>${fmt(info.liveness_prob_real)}</b> | prob_spoof: <b>${fmt(info.liveness_prob_spoof)}</b><br>
+                ${info.liveness_model ? `• model: <b>${info.liveness_model}</b><br>` : ""}
+                ${info.debug_liveness ? `<span class="muted mono">debug: ${info.debug_liveness}</span>` : ""}
+              </div>`;
+
+            // tetap simpan json detail
+            jsonBox.textContent = JSON.stringify(data, null, 2) + extra;
+
           } else {
             showResultCardSuccess(info);
           }
+
         } else {
           showResultCardFail("Response tidak sesuai format yang diharapkan.", data);
         }

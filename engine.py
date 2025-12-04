@@ -1,4 +1,5 @@
-# engine.py - ArcFace + MTCNN (DeepFace 0.0.96 compatible) + Liveness (OpenVINO anti-spoof-mn3 + optional DeepFace anti_spoofing)
+# engine.py - ArcFace + MTCNN (DeepFace 0.0.96 compatible)
+# + Liveness (OpenVINO anti-spoof-mn3 + optional DeepFace anti_spoofing)
 import json
 import os
 from typing import Dict, Any, Optional, List, Tuple
@@ -19,20 +20,24 @@ OV_PASS = 0.60           # target "aman"
 OV_UNCERTAIN_LOW = 0.45  # bawah ini -> nanggung / minta ulang
 OV_STRONG_SPOOF = 0.30   # bawah ini -> spoof kuat
 
-# DeepFace antispoof score band 
+# DeepFace antispoof score band
 DF_PASS = 0.80
 DF_STRONG_LIVE = 0.92
 DF_STRONG_SPOOF = 0.55
 
 # Quality gate (biar webcam jelek tidak langsung dituduh spoof)
 MIN_FACE_AREA = 90 * 90
-MIN_FACE_CONF = 0.90
-MIN_BLUR_VAR = 35.0
-MIN_BRIGHT = 35.0
-MAX_BRIGHT = 225.0
+MIN_FACE_CONF = 0.80
+MIN_BLUR_VAR = 15.0          # <- FIX: jangan ".0" / 0; ini longgar tapi masih nyaring blur parah
+MIN_BRIGHT = 25.0
+MAX_BRIGHT = 240.0
 
 # Optional: enforce liveness on enrollment
 ENROLL_REQUIRE_LIVENESS = True
+
+# ================== MATCH CONFIG ==================
+DEFAULT_THRESHOLD = 3.5       
+MATCH_MARGIN = 0.20        
 
 # OpenVINO globals
 _OV_CORE: Optional[ov.Core] = None
@@ -63,13 +68,13 @@ def load_liveness_model() -> None:
 def load_db() -> Dict[str, Any]:
     if not os.path.exists(DB_PATH):
         return {}
-    with open(DB_PATH, "r") as f:
+    with open(DB_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_db(db: Dict[str, Any]) -> None:
-    with open(DB_PATH, "w") as f:
-        json.dump(db, f, indent=2)
+    with open(DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2, ensure_ascii=False)
 
 
 # ================== UTIL IMAGE ==================
@@ -144,7 +149,7 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
       {
         is_live: bool,
         reason: ok|spoof_detected|liveness_uncertain|quality_low|bypass,
-        prob_real: float, prob_spoof: float,  (OpenVINO mean)
+        prob_real: float|None, prob_spoof: float|None,  (OpenVINO mean)
         df_is_real: bool|None, df_score: float|None,
         model: str,
         debug: str
@@ -209,8 +214,8 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             return {
                 "is_live": False,
                 "reason": "quality_low",
-                "prob_real": 0.0,
-                "prob_spoof": 1.0,
+                "prob_real": None,
+                "prob_spoof": None,
                 "df_is_real": None,
                 "df_score": None,
                 "model": "anti-spoof-mn3(+deepface)",
@@ -221,8 +226,8 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
         return {
             "is_live": False,
             "reason": "quality_low",
-            "prob_real": 0.0,
-            "prob_spoof": 1.0,
+            "prob_real": None,
+            "prob_spoof": None,
             "df_is_real": None,
             "df_score": None,
             "model": "anti-spoof-mn3(+deepface)",
@@ -259,8 +264,8 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
         return {
             "is_live": False,
             "reason": "quality_low",
-            "prob_real": 0.0,
-            "prob_spoof": 1.0,
+            "prob_real": None,
+            "prob_spoof": None,
             "df_is_real": df_is_real,
             "df_score": df_score,
             "model": "anti-spoof-mn3(+deepface)",
@@ -290,8 +295,8 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
         return {
             "is_live": False,
             "reason": "quality_low",
-            "prob_real": 0.0,
-            "prob_spoof": 1.0,
+            "prob_real": None,
+            "prob_spoof": None,
             "df_is_real": df_is_real,
             "df_score": df_score,
             "model": "anti-spoof-mn3(+deepface)",
@@ -302,6 +307,7 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
     ov_spoof = float(np.mean(ov_spoofs))
 
     # 4) Decision logic (reduce false reject + reduce replay pass)
+
     # Hard spoof conditions
     if ov_real <= OV_STRONG_SPOOF:
         return {
@@ -327,8 +333,34 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "debug": f"FAIL(df_strong_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score:.3f}"
         }
 
+    # Strong-live shortcut: kalau OpenVINO sudah sangat yakin, jangan diganggu DF yang kadang fluktuatif
+    if ov_real >= 0.90:
+        # kalau DF skornya parah banget baru jangan lolos
+        if df_score is not None and df_score <= DF_STRONG_SPOOF:
+            return {
+                "is_live": False,
+                "reason": "spoof_detected",
+                "prob_real": ov_real,
+                "prob_spoof": ov_spoof,
+                "df_is_real": df_is_real,
+                "df_score": df_score,
+                "model": "anti-spoof-mn3+deepface",
+                "debug": f"FAIL(df_strong_spoof_override) ov_real={ov_real:.3f} df_score={df_score:.3f}"
+            }
+
+        return {
+            "is_live": True,
+            "reason": "ok",
+            "prob_real": ov_real,
+            "prob_spoof": ov_spoof,
+            "df_is_real": df_is_real,
+            "df_score": df_score,
+            "model": "anti-spoof-mn3(+deepface)",
+            "debug": f"PASS(ov_strong_live) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
+        }
+
     # Pass conditions
-    if df_is_real is None:
+    if df_score is None:
         # No DF module available -> rely on OpenVINO only
         if ov_real >= OV_PASS:
             return {
@@ -353,32 +385,31 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "debug": f"UNCERTAIN(ov_only) ov_real={ov_real:.3f}"
         }
 
-    # DF available: require "mostly agree" (reduce replay pass)
-    if df_is_real is True and df_score is not None:
-        if (ov_real >= OV_PASS and df_score >= DF_PASS):
-            return {
-                "is_live": True,
-                "reason": "ok",
-                "prob_real": ov_real,
-                "prob_spoof": ov_spoof,
-                "df_is_real": True,
-                "df_score": df_score,
-                "model": "anti-spoof-mn3+deepface",
-                "debug": f"PASS(both) ov_real={ov_real:.3f} df_score={df_score:.3f}"
-            }
+    # DF available: treat score as bonus (jangan terlalu percaya df_is_real)
+    if (ov_real >= OV_PASS and df_score >= DF_PASS):
+        return {
+            "is_live": True,
+            "reason": "ok",
+            "prob_real": ov_real,
+            "prob_spoof": ov_spoof,
+            "df_is_real": df_is_real,
+            "df_score": df_score,
+            "model": "anti-spoof-mn3+deepface",
+            "debug": f"PASS(both) ov_real={ov_real:.3f} df_score={df_score:.3f}"
+        }
 
-        # allow DF super-strong to rescue weak webcam, but still not too low OV
-        if (df_score >= DF_STRONG_LIVE and ov_real >= OV_UNCERTAIN_LOW):
-            return {
-                "is_live": True,
-                "reason": "ok",
-                "prob_real": ov_real,
-                "prob_spoof": ov_spoof,
-                "df_is_real": True,
-                "df_score": df_score,
-                "model": "anti-spoof-mn3+deepface",
-                "debug": f"PASS(df_rescue) ov_real={ov_real:.3f} df_score={df_score:.3f}"
-            }
+    # allow DF super-strong to rescue weak webcam, but still not too low OV
+    if (df_score >= DF_STRONG_LIVE and ov_real >= OV_UNCERTAIN_LOW):
+        return {
+            "is_live": True,
+            "reason": "ok",
+            "prob_real": ov_real,
+            "prob_spoof": ov_spoof,
+            "df_is_real": df_is_real,
+            "df_score": df_score,
+            "model": "anti-spoof-mn3+deepface",
+            "debug": f"PASS(df_rescue) ov_real={ov_real:.3f} df_score={df_score:.3f}"
+        }
 
     # otherwise -> uncertain (ask recapture)
     return {
@@ -416,49 +447,74 @@ def get_arcface_embedding(image_bytes: bytes) -> np.ndarray:
 
 # ================== MATCH CORE (NO LIVENESS) ==================
 
-def _recognize_no_liveness(image_bytes: bytes, threshold: float = 3.5) -> Dict[str, Any]:
+def _recognize_no_liveness(image_bytes: bytes, threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
     db = load_db()
     if not db:
         return {"match": False, "reason": "Database kosong."}
 
+    threshold = float(threshold)
     query_emb = get_arcface_embedding(image_bytes)
 
     best_id: Optional[str] = None
     best_name: Optional[str] = None
     best_dist: float = 999.0
 
+    second_id: Optional[str] = None
+    second_dist: float = 999.0
+
+    # ✅ hitung jarak terbaik PER ORANG (min dari semua embedding milik orang itu)
     for emp_id, data in db.items():
-        name = data["name"]
-        for emb in data["embeddings"]:
+        name = data.get("name")
+        embs = data.get("embeddings", []) or []
+        if not embs:
+            continue
+
+        emp_best = 999.0
+        for emb in embs:
             emb_vec = np.array(emb, dtype=np.float32)
             dist = float(np.linalg.norm(query_emb - emb_vec))
-            if dist < best_dist:
-                best_dist = dist
-                best_id = emp_id
-                best_name = name
+            if dist < emp_best:
+                emp_best = dist
 
-    if best_id is not None and best_dist < threshold:
-        if best_dist < 2.0:
-            confidence = "high"
-        elif best_dist < 3.5:
-            confidence = "medium"
-        else:
-            confidence = "low"
+        if emp_best < best_dist:
+            second_id, second_dist = best_id, best_dist
+            best_id, best_dist = emp_id, emp_best
+            best_name = name
+        elif emp_best < second_dist:
+            second_id, second_dist = emp_id, emp_best
 
+    if best_id is None:
+        return {"match": False, "reason": "Tidak ada wajah cocok.", "threshold": threshold}
+
+    margin = float(second_dist - best_dist)
+    margin_ok = (second_id is None) or (margin >= MATCH_MARGIN) or (second_dist >= 998.0)
+
+    if best_dist < threshold and margin_ok:
+        confidence = "high" if best_dist < 2.0 else ("medium" if best_dist < 3.0 else "low")
         return {
             "match": True,
             "employee_id": best_id,
             "name": best_name,
             "distance": float(best_dist),
-            "threshold": float(threshold),
-            "confidence": confidence
+            "threshold": threshold,
+            "confidence": confidence,
+            # debug tambahan (boleh dipakai/tidak)
+            "second_best_employee_id": second_id,
+            "second_best_distance": float(second_dist),
+            "margin": margin,
+            "margin_ok": margin_ok,
         }
 
     return {
         "match": False,
         "reason": "Tidak ada wajah cocok.",
         "best_distance": float(best_dist),
-        "threshold": float(threshold)
+        "threshold": threshold,
+        # debug tambahan
+        "second_best_employee_id": second_id,
+        "second_best_distance": float(second_dist),
+        "margin": margin,
+        "margin_ok": margin_ok,
     }
 
 
@@ -486,7 +542,7 @@ def register_face(employee_id: str, name: str, image_bytes: bytes) -> Dict[str, 
 
 # ================== RECOGNIZE (SINGLE) ==================
 
-def recognize_face(image_bytes: bytes, threshold: float = 3.5) -> Dict[str, Any]:
+def recognize_face(image_bytes: bytes, threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
     live = detect_spoof(image_bytes)
 
     if not live["is_live"]:
@@ -519,7 +575,7 @@ def recognize_face(image_bytes: bytes, threshold: float = 3.5) -> Dict[str, Any]
 
 # ================== RECOGNIZE (MULTI) ==================
 
-def recognize_face_multi(images_bytes: List[bytes], threshold: float = 3.5) -> Dict[str, Any]:
+def recognize_face_multi(images_bytes: List[bytes], threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
     """
     Vote across N frames:
     - If >= ceil(N*0.6) frames pass liveness => accept, then recognize using best liveness frame.
@@ -529,15 +585,13 @@ def recognize_face_multi(images_bytes: List[bytes], threshold: float = 3.5) -> D
     if not images_bytes:
         return {"match": False, "liveness_ok": False, "reason": "quality_low", "debug_liveness": "no images"}
 
-    results = []
-    for b in images_bytes:
-        results.append(detect_spoof(b))
+    results = [detect_spoof(b) for b in images_bytes]
 
     pass_count = sum(1 for r in results if r.get("is_live"))
     n = len(results)
     need = int(np.ceil(n * 0.6))
 
-    # pick best frame for recognition (highest ov real)
+    # pick best frame for recognition (highest ov real; None -> 0.0)
     best_idx = int(np.argmax([_safe_float(r.get("prob_real"), 0.0) for r in results]))
     best_live = results[best_idx]
 
@@ -556,7 +610,6 @@ def recognize_face_multi(images_bytes: List[bytes], threshold: float = 3.5) -> D
         })
         return rec
 
-    # if any strong spoof_detected
     if any(r.get("reason") == "spoof_detected" for r in results):
         return {
             "match": False,
