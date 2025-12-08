@@ -127,7 +127,7 @@ async def list_users():
         db = json.load(f)
 
     users = [
-        {
+        {  
             "employee_id": emp_id,
             "name": data.get("name"),
             "num_embeddings": len(data.get("embeddings", []) or []),

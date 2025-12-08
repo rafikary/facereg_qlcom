@@ -127,8 +127,37 @@
       border-left: 4px solid #57606f;
     }
 
+    .mini {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #636e72;
+      text-align: left;
+      background: #f8f9fa;
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px solid #eef0f2;
+    }
+
+    .mini a { color:#0984e3; text-decoration:none; }
+    .mini a:hover { text-decoration:underline; }
+
+    /* DISABLE BOX INFO API */
+    #apiInfo {
+      display: none;
+    }
+
     .muted { color:#636e72; font-size:12px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
+    input {
+      width: 100%;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid #dfe6e9;
+      margin-top: 8px;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
   </style>
 </head>
 <body>
@@ -141,30 +170,65 @@
     <button id="captureBtn">Ambil Foto & Cek</button>
     <button id="tipsBtn" class="btn-secondary">Cara Tes Spoof (HP/Monitor)</button>
 
-    <div id="tipsBox" class="tips">
+    <div class="tips" id="tipsBox">
       <div><b>Tips supaya hasil stabil:</b></div>
       <ul style="margin:8px 0 0 18px; padding:0;">
         <li>Posisikan wajah 40–70 cm dari kamera</li>
-        <li>Jangan backlight (lampu/ jendela di belakang)</li>
+        <li>Jangan backlight (lampu/jendela di belakang)</li>
         <li>Hindari glare kacamata (miringkan sedikit)</li>
         <li>Kalau mau uji spoof: tampilkan foto di HP/monitor, lalu gerakkan pelan</li>
       </ul>
-      <div class="muted">Frontend ini sudah ambil 3 frame dan pilih yang paling tajam (biar nggak random).</div>
+      <div class="muted">Frontend ini ambil beberapa frame dan pilih yang paling tajam.</div>
+    </div>
+
+    <!-- INFO API (disembunyikan biar JS tetap aman) -->
+    <div class="mini" id="apiInfo">
+      <div><b>API target:</b> <span id="apiBaseTxt" class="mono"></span></div>
+      <div style="margin-top:6px;">
+        <a id="docsLink" href="#" target="_blank" rel="noopener">Buka /docs</a>
+        <span class="muted"> (untuk bukti demo)</span>
+      </div>
+      <div class="muted" style="margin-top:6px;">
+        Override URL: <span class="mono">?api=http://127.0.0.1:8000</span>
+      </div>
     </div>
 
     <div id="resultBox" class="result-card" style="display:none;"></div>
-    <div class="json-raw" id="jsonBox">Belum ada request.</div>
 
+    <!-- MANUAL BOX: muncul setelah 2x gagal (quality_low / liveness_uncertain / face_not_detected) -->
+    <div id="manualBox" class="result-card result-fail" style="display:none;">
+      <div class="result-title">📝 Input Manual</div>
+      <div class="result-detail">
+        Sudah <b><span id="failCountTxt">2</span>x</b> gagal karena kualitas/lighting.<br>
+        Masukkan <b>Employee ID</b>:
+        <input id="manualId" placeholder="contoh: EMP001" />
+        <button id="useManualBtn" style="margin-top:10px;">Gunakan ID Manual (Demo)</button>
+        <button id="resetFailBtn" class="btn-secondary" style="margin-top:8px;">Reset Counter</button>
+        <div class="muted" style="margin-top:8px;">
+          Catatan: untuk production sebaiknya manual tidak diaktifkan, atau butuh approval admin.
+        </div>
+      </div>
+    </div>
+
+    <div class="json-raw" id="jsonBox">Belum ada request.</div>
     <canvas id="canvas" style="display:none;"></canvas>
   </div>
 
   <script>
     // ===================== CONFIG =====================
-    const API_BASE = "http://127.0.0.1:8000";
-    const CAPTURE_DELAY_MS = 250;  // tunggu auto exposure settle
-    const BURST_COUNT = 5;         // ambil 3 frame
-    const BURST_GAP_MS = 120;      // jeda antar frame
-    const DOWNSAMPLE_STEP = 4;     // hemat CPU saat hitung sharpness
+    const DEFAULT_API_BASE = "http://127.0.0.1:8000"; // uvicorn kamu
+    const params = new URLSearchParams(window.location.search);
+    const API_BASE = (params.get("api") || DEFAULT_API_BASE).replace(/\/+$/, "");
+
+    const CAPTURE_DELAY_MS = 250;
+    const BURST_COUNT = 5;
+    const BURST_GAP_MS = 120;
+    const DOWNSAMPLE_STEP = 4;
+
+    // Manual policy: baru tampil setelah 2x gagal kualitas
+    const MANUAL_AFTER_FAILS = 2;
+    let failStreak = 0;
+    let manualChosenId = "";
 
     // ===================== ELEMENTS =====================
     const video = document.getElementById("video");
@@ -175,25 +239,57 @@
     const resultBox = document.getElementById("resultBox");
     const jsonBox = document.getElementById("jsonBox");
 
+    const apiBaseTxt = document.getElementById("apiBaseTxt");
+    const docsLink = document.getElementById("docsLink");
+
+    const manualBox = document.getElementById("manualBox");
+    const manualId = document.getElementById("manualId");
+    const useManualBtn = document.getElementById("useManualBtn");
+    const resetFailBtn = document.getElementById("resetFailBtn");
+    const failCountTxt = document.getElementById("failCountTxt");
+
+    apiBaseTxt.textContent = API_BASE;
+    docsLink.href = `${API_BASE}/docs`;
+
     tipsBtn.addEventListener("click", () => {
       tipsBox.style.display = tipsBox.style.display === "none" ? "block" : "none";
+    });
+
+    useManualBtn.addEventListener("click", () => {
+      const v = String(manualId.value || "").trim();
+      if (!v) {
+        alert("Isi Employee ID dulu.");
+        return;
+      }
+      manualChosenId = v;
+      resultBox.style.display = "block";
+      resultBox.className = "result-card result-success";
+      resultBox.innerHTML =
+        `<div class="result-title">✅ Manual ID dipilih (DEMO)</div>` +
+        `<div class="result-detail">
+          Employee ID: <b>${manualChosenId}</b><br>
+          <span class="muted">Ini hanya untuk pembuktian flow UI. (Belum post attendance di sini)</span>
+        </div>`;
+    });
+
+    resetFailBtn.addEventListener("click", () => {
+      failStreak = 0;
+      manualChosenId = "";
+      manualId.value = "";
+      manualBox.style.display = "none";
+      alert("Counter gagal di-reset.");
     });
 
     async function startCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: "user",
-            width: { ideal: 1280 },
-            height: { ideal: 720 }
-          }
+          video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }
         });
         video.srcObject = stream;
       } catch (err) {
         alert("Gagal akses kamera: " + err.message);
       }
     }
-
     startCamera();
 
     // ===================== HELPERS =====================
@@ -209,7 +305,6 @@
 
       const step = DOWNSAMPLE_STEP;
 
-      // luminance helper
       const lumAt = (x, y) => {
         const i = (y * w + x) * 4;
         const r = d[i], g = d[i+1], b = d[i+2];
@@ -223,8 +318,6 @@
           const r = lumAt(x + 1, y);
           const u = lumAt(x, y - 1);
           const dn = lumAt(x, y + 1);
-
-          // simple Laplacian
           const lap = (4 * c - l - r - u - dn);
 
           sumB += c;
@@ -237,27 +330,22 @@
       const meanLap = sumLap / Math.max(1, cnt);
       const varLap = (sumLap2 / Math.max(1, cnt)) - (meanLap * meanLap);
 
-      // penalize ekstrem brightness (bikin liveness sering ngawur)
       let penalty = 0;
       if (bright < 50) penalty += (50 - bright) * 2;
       if (bright > 210) penalty += (bright - 210) * 2;
 
       const score = varLap - penalty;
-
       return { bright, varLap, score };
     }
 
     async function canvasToBlobPNG(canvasEl) {
       return new Promise((resolve) => {
-        canvasEl.toBlob((blob) => resolve(blob), "image/png"); // PNG (lossless)
+        canvasEl.toBlob((blob) => resolve(blob), "image/png");
       });
     }
 
     async function captureBestFrameBlob() {
-      // pastikan video ready
-      if (!video.videoWidth || !video.videoHeight) {
-        await sleep(200);
-      }
+      if (!video.videoWidth || !video.videoHeight) await sleep(200);
 
       const w = video.videoWidth;
       const h = video.videoHeight;
@@ -266,41 +354,72 @@
       canvas.height = h;
 
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
-
-      // tunggu auto exposure settle
       await sleep(CAPTURE_DELAY_MS);
 
       let best = null;
-
       for (let i = 0; i < BURST_COUNT; i++) {
         ctx.drawImage(video, 0, 0, w, h);
-
         const metrics = computeMetricsFromCanvas(ctx, w, h);
         const blob = await canvasToBlobPNG(canvas);
 
         const candidate = { blob, metrics };
-        if (!best || candidate.metrics.score > best.metrics.score) {
-          best = candidate;
-        }
+        if (!best || candidate.metrics.score > best.metrics.score) best = candidate;
 
         await sleep(BURST_GAP_MS);
       }
-
-      return best; // {blob, metrics}
+      return best;
     }
 
     function fmt(n, digits=3) {
       return (typeof n === "number" && isFinite(n)) ? n.toFixed(digits) : "-";
     }
 
-    // === UPDATED: tampilkan hasil match/no match dengan wording jelas ===
-    function showResultCardSuccess(info) {
+    function shouldOfferManual(info) {
+      const reason = String(info?.reason || info?.liveness_reason || "").toLowerCase();
+      // jangan pernah manual kalau spoof
+      if (reason.includes("spoof")) return false;
+
+      // kandidat manual: kualitas jelek / liveness ragu / face not detected
+      return (
+        reason === "quality_low" ||
+        reason === "liveness_uncertain" ||
+        reason === "face_not_detected" ||
+        (typeof info?.detail === "string" && info.detail.toLowerCase().includes("wajah"))
+      );
+    }
+
+    function bumpFailStreakIfNeeded(info) {
+      const reason = String(info?.reason || info?.liveness_reason || "").toLowerCase();
+      if (reason.includes("spoof")) {
+        // spoof -> reset dan jangan tampilkan manual
+        failStreak = 0;
+        return;
+      }
+      if (shouldOfferManual(info)) {
+        failStreak += 1;
+      } else {
+        // non-quality fail (misal no match) -> reset (biar manual nggak muncul untuk "tidak dikenali")
+        failStreak = 0;
+      }
+    }
+
+    function renderManualBox() {
+      if (failStreak >= MANUAL_AFTER_FAILS) {
+        failCountTxt.textContent = String(failStreak);
+        manualBox.style.display = "block";
+      } else {
+        manualBox.style.display = "none";
+      }
+    }
+
+    function showResultBoxFor(info, frameMetrics) {
       resultBox.style.display = "block";
 
-      const reason = (info.reason || "").toLowerCase();
-      const isDbEmpty = reason.includes("database kosong");
+      // kalau match
+      if (info.match === true) {
+        failStreak = 0;
+        manualBox.style.display = "none";
 
-      if (info.match) {
         resultBox.className = "result-card result-success";
         resultBox.innerHTML =
           `<div class="result-title">✅ Wajah dikenali</div>` +
@@ -313,27 +432,51 @@
             </div>
             ${info.liveness_model ? `<div class="muted">Model: ${info.liveness_model}</div>` : ""}
             ${info.debug_liveness ? `<div class="muted mono">debug: ${info.debug_liveness}</div>` : ""}
+            ${frameMetrics ? `<div class="muted mono" style="margin-top:6px;">frame: bright=${frameMetrics.bright.toFixed(1)} lap_var=${frameMetrics.varLap.toFixed(1)}</div>` : ""}
           </div>`;
         return;
       }
 
-      // No match but liveness ok
-      resultBox.className = "result-card result-fail";
+      // kalau liveness gagal
+      if (info.liveness_ok === false) {
+        const r = String(info.reason || info.liveness_reason || "spoof_detected");
+        const msgMap = {
+          spoof_detected: {
+            title: "⛔ Ditolak (indikasi spoof)",
+            detail: "Terindikasi bukan wajah live. Silakan ulang dengan wajah asli di depan kamera."
+          },
+          liveness_uncertain: {
+            title: "⚠️ Liveness belum yakin",
+            detail: "Sistem belum yakin ini live. Coba ulang beberapa detik dengan posisi stabil."
+          },
+          quality_low: {
+            title: "⚠️ Kualitas gambar kurang",
+            detail: "Gambar gelap/terlalu terang/blur/wajah terlalu kecil. Perbaiki lighting & jarak kamera."
+          },
+          face_not_detected: {
+            title: "⚠️ Wajah tidak terdeteksi",
+            detail: "Wajah tidak terdeteksi sama sekali. Coba ulang dengan wajah lebih dekat & terang."
+          }
+        };
 
-      if (isDbEmpty) {
+        const m2 = msgMap[r] || msgMap["liveness_uncertain"];
+
+        resultBox.className = "result-card result-fail";
         resultBox.innerHTML =
-          `<div class="result-title">ℹ️ Belum ada data wajah</div>` +
+          `<div class="result-title">${m2.title}</div>` +
           `<div class="result-detail">
-            Database masih kosong. Silakan lakukan <b>pendaftaran wajah</b> terlebih dulu.<br>
-            <div class="muted" style="margin-top:6px;">
-              Liveness: <b>OK</b> | prob_real: <b>${fmt(info.liveness_prob_real)}</b> | prob_spoof: <b>${fmt(info.liveness_prob_spoof)}</b>
-            </div>
-            ${info.liveness_model ? `<div class="muted">Model: ${info.liveness_model}</div>` : ""}
-            ${info.debug_liveness ? `<div class="muted mono">debug: ${info.debug_liveness}</div>` : ""}
+            ${m2.detail}<br><br>
+            • reason: <b>${r}</b><br>
+            • prob_real: <b>${fmt(info.liveness_prob_real)}</b> | prob_spoof: <b>${fmt(info.liveness_prob_spoof)}</b><br>
+            ${info.liveness_model ? `• model: <b>${info.liveness_model}</b><br>` : ""}
+            ${info.debug_liveness ? `<span class="muted mono">debug: ${info.debug_liveness}</span>` : ""}
+            ${frameMetrics ? `<div class="muted mono" style="margin-top:6px;">frame: bright=${frameMetrics.bright.toFixed(1)} lap_var=${frameMetrics.varLap.toFixed(1)}</div>` : ""}
           </div>`;
         return;
       }
 
+      // no match tapi liveness ok
+      resultBox.className = "result-card result-fail";
       resultBox.innerHTML =
         `<div class="result-title">❌ Wajah tidak dikenali</div>` +
         `<div class="result-detail">
@@ -343,21 +486,11 @@
           <div class="muted" style="margin-top:6px;">
             Liveness: <b>OK</b> | prob_real: <b>${fmt(info.liveness_prob_real)}</b> | prob_spoof: <b>${fmt(info.liveness_prob_spoof)}</b>
           </div>
-          ${info.liveness_model ? `<div class="muted">Model: ${info.liveness_model}</div>` : ""}
-          ${info.debug_liveness ? `<div class="muted mono">debug: ${info.debug_liveness}</div>` : ""}
         </div>`;
-    }
 
-    function showResultCardFail(msg, detailJson) {
-      resultBox.style.display = "block";
-      resultBox.className = "result-card result-fail";
-      resultBox.innerHTML =
-        `<div class="result-title">⛔ Ditolak / Error</div>` +
-        `<div class="result-detail">${msg}</div>`;
-
-      if (detailJson) {
-        jsonBox.textContent = JSON.stringify(detailJson, null, 2);
-      }
+      // untuk case "tidak dikenali", jangan manual
+      failStreak = 0;
+      manualBox.style.display = "none";
     }
 
     // ===================== MAIN ACTION =====================
@@ -367,21 +500,17 @@
 
       try {
         const best = await captureBestFrameBlob();
-
         captureBtn.textContent = "Mengirim ke server...";
 
         const formData = new FormData();
         formData.append("image", best.blob, "capture.png");
 
-        const res = await fetch(`${API_BASE}/recognize`, {
-          method: "POST",
-          body: formData,
-        });
+        console.log("[UI] POST", `${API_BASE}/recognize`, { file: "capture.png", size: best.blob.size });
 
+        const res = await fetch(`${API_BASE}/recognize`, { method: "POST", body: formData });
         if (!res.ok) {
           const errBody = await res.json().catch(() => ({}));
-          const msg = errBody.detail || `HTTP Error ${res.status}`;
-          throw new Error(msg);
+          throw new Error(errBody.detail || `HTTP Error ${res.status}`);
         }
 
         const data = await res.json();
@@ -390,56 +519,29 @@
         if (data.status === "success" && data.data) {
           const info = data.data;
 
-          // tampilkan metrik frame yang dipilih (debug)
+          // update fail streak + manual visibility
+          bumpFailStreakIfNeeded(info);
+          renderManualBox();
+
+          // render result
+          showResultBoxFor(info, best.metrics);
+
+          // tambah debug frame metrics di json box
           const m = best.metrics;
-          const extra = `\n\n[frame_metrics]\nbrightness=${m.bright.toFixed(1)}\nlap_var=${m.varLap.toFixed(1)}\nscore=${m.score.toFixed(1)}\n`;
-          jsonBox.textContent += extra;
-
-          // === UPDATED: mapping alasan liveness supaya jelas ===
-          if (info.liveness_ok === false) {
-            const r = (info.reason || info.liveness_reason || "spoof_detected");
-            const msgMap = {
-              spoof_detected: {
-                title: "⛔ Ditolak (indikasi spoof)",
-                detail: "Terindikasi bukan wajah live (misalnya foto/layar/galeri/print). Silakan coba ulang dengan wajah asli di depan kamera."
-              },
-              liveness_uncertain: {
-                title: "⚠️ Liveness belum yakin",
-                detail: "Sistem belum yakin ini live karena hasil liveness tidak konsisten. Silakan ambil ulang 3–5 detik dengan posisi stabil."
-              },
-              quality_low: {
-                title: "⚠️ Kualitas gambar kurang",
-                detail: "Kualitas gambar kurang bagus (gelap/terlalu terang/blur/wajah terlalu kecil). Silakan ulang dengan pencahayaan lebih baik dan wajah lebih dekat."
-              }
-            };
-
-            const m2 = msgMap[r] || msgMap["liveness_uncertain"];
-
-            resultBox.style.display = "block";
-            resultBox.className = "result-card result-fail";
-            resultBox.innerHTML =
-              `<div class="result-title">${m2.title}</div>` +
-              `<div class="result-detail">
-                ${m2.detail}<br><br>
-                • reason: <b>${r}</b><br>
-                • prob_real: <b>${fmt(info.liveness_prob_real)}</b> | prob_spoof: <b>${fmt(info.liveness_prob_spoof)}</b><br>
-                ${info.liveness_model ? `• model: <b>${info.liveness_model}</b><br>` : ""}
-                ${info.debug_liveness ? `<span class="muted mono">debug: ${info.debug_liveness}</span>` : ""}
-              </div>`;
-
-            // tetap simpan json detail
-            jsonBox.textContent = JSON.stringify(data, null, 2) + extra;
-
-          } else {
-            showResultCardSuccess(info);
-          }
+          jsonBox.textContent +=
+            `\n\n[frame_metrics]\nbrightness=${m.bright.toFixed(1)}\nlap_var=${m.varLap.toFixed(1)}\nscore=${m.score.toFixed(1)}\n` +
+            `\n[fail_streak]\nfailStreak=${failStreak}\nmanual_after=${MANUAL_AFTER_FAILS}\n`;
 
         } else {
           showResultCardFail("Response tidak sesuai format yang diharapkan.", data);
         }
 
       } catch (err) {
-        showResultCardFail(`Error: ${err.message}`);
+        resultBox.style.display = "block";
+        resultBox.className = "result-card result-fail";
+        resultBox.innerHTML =
+          `<div class="result-title">⛔ Ditolak / Error</div>` +
+          `<div class="result-detail">Error: ${err.message}</div>`;
         jsonBox.textContent = "Error: " + err.message;
       } finally {
         captureBtn.disabled = false;
