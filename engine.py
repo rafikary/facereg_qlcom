@@ -16,21 +16,21 @@ DETECTOR_BACKEND = "mtcnn"
 LIVENESS_MODEL_PATH = "models/anti-spoof-mn3.onnx"
 
 # OpenVINO score band
-OV_PASS = 0.60           # target "aman"
+OV_PASS = 0.55           # target "aman" (relaxed untuk real faces)
 OV_UNCERTAIN_LOW = 0.45  # bawah ini -> nanggung / minta ulang
 OV_STRONG_SPOOF = 0.30   # bawah ini -> spoof kuat
 
 # DeepFace antispoof score band
-DF_PASS = 0.90          # dinaikkan: perlu score tinggi untuk lolos
+DF_PASS = 0.85          # relaxed sedikit untuk kondisi lighting buruk
 DF_STRONG_LIVE = 0.95   # super yakin hidup
 DF_STRONG_SPOOF = 0.50  # score di bawah ini + flag spoof => spoof kuat
 
-# Quality gate (biar webcam jelek tidak langsung dituduh spoof)
+# Quality gate (lebih toleran untuk webcam/kondisi lighting tidak ideal)
 MIN_FACE_AREA = 90 * 90
-MIN_FACE_CONF = 0.80
-MIN_BLUR_VAR = 15.0
-MIN_BRIGHT = 25.0
-MAX_BRIGHT = 240.0
+MIN_FACE_CONF = 0.70     # relaxed dari 0.80
+MIN_BLUR_VAR = 10.0      # relaxed dari 15.0
+MIN_BRIGHT = 15.0        # relaxed dari 25.0 (toleran backlight)
+MAX_BRIGHT = 250.0       # relaxed dari 240.0
 
 # Optional: enforce liveness on enrollment
 ENROLL_REQUIRE_LIVENESS = True
@@ -132,6 +132,26 @@ def _infer_ov(face_bgr_u8: np.ndarray) -> Tuple[float, float]:
         p0, p1 = float(sm[0]), float(sm[1])
 
     return p0, p1
+
+
+def _enhance_lighting(face_bgr_u8: np.ndarray) -> np.ndarray:
+    """
+    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    untuk normalize lighting dan handle backlight/underexposed images.
+    """
+    # Convert to LAB color space
+    lab = cv2.cvtColor(face_bgr_u8, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    
+    # Apply CLAHE to L channel (brightness)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_clahe = clahe.apply(l)
+    
+    # Merge channels and convert back to BGR
+    lab_clahe = cv2.merge([l_clahe, a, b])
+    enhanced = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+    
+    return enhanced
 
 
 def _quality_metrics(face_bgr_u8: np.ndarray) -> Dict[str, float]:
@@ -273,7 +293,7 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
         }
 
     # 3) OpenVINO multi-crop inference from bbox (stabilizer + include background)
-    # If bbox missing, just use face_u8
+    # Apply CLAHE preprocessing untuk handle bad lighting
     ov_scores = []
     ov_spoofs = []
 
@@ -283,11 +303,15 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             crop = img_bgr[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
-            p_real, p_spoof = _infer_ov(crop.astype(np.uint8))
+            # Apply CLAHE preprocessing untuk normalize lighting
+            crop_enhanced = _enhance_lighting(crop.astype(np.uint8))
+            p_real, p_spoof = _infer_ov(crop_enhanced)
             ov_scores.append(p_real)
             ov_spoofs.append(p_spoof)
     else:
-        p_real, p_spoof = _infer_ov(face_u8)
+        # Apply CLAHE ke face crop juga
+        face_enhanced = _enhance_lighting(face_u8)
+        p_real, p_spoof = _infer_ov(face_enhanced)
         ov_scores.append(p_real)
         ov_spoofs.append(p_spoof)
 
