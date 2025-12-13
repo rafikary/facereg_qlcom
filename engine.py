@@ -21,14 +21,14 @@ OV_UNCERTAIN_LOW = 0.45  # bawah ini -> nanggung / minta ulang
 OV_STRONG_SPOOF = 0.30   # bawah ini -> spoof kuat
 
 # DeepFace antispoof score band
-DF_PASS = 0.80
-DF_STRONG_LIVE = 0.92
-DF_STRONG_SPOOF = 0.55
+DF_PASS = 0.90          # dinaikkan: perlu score tinggi untuk lolos
+DF_STRONG_LIVE = 0.95   # super yakin hidup
+DF_STRONG_SPOOF = 0.50  # score di bawah ini + flag spoof => spoof kuat
 
 # Quality gate (biar webcam jelek tidak langsung dituduh spoof)
 MIN_FACE_AREA = 90 * 90
 MIN_FACE_CONF = 0.80
-MIN_BLUR_VAR = 15.0          # <- FIX: jangan ".0" / 0; ini longgar tapi masih nyaring blur parah
+MIN_BLUR_VAR = 15.0
 MIN_BRIGHT = 25.0
 MAX_BRIGHT = 240.0
 
@@ -36,8 +36,8 @@ MAX_BRIGHT = 240.0
 ENROLL_REQUIRE_LIVENESS = True
 
 # ================== MATCH CONFIG ==================
-DEFAULT_THRESHOLD = 3.5       
-MATCH_MARGIN = 0.20        
+DEFAULT_THRESHOLD = 3.5
+MATCH_MARGIN = 0.20
 
 # OpenVINO globals
 _OV_CORE: Optional[ov.Core] = None
@@ -306,9 +306,9 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
     ov_real = float(np.mean(ov_scores))
     ov_spoof = float(np.mean(ov_spoofs))
 
-    # 4) Decision logic (reduce false reject + reduce replay pass)
+    # 4) Decision logic (lebih ketat ke spoof HP/monitor)
 
-    # Hard spoof conditions
+    # --- Hard spoof: OpenVINO sangat yakin spoof
     if ov_real <= OV_STRONG_SPOOF:
         return {
             "is_live": False,
@@ -321,7 +321,9 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "debug": f"FAIL(ov_strong_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
         }
 
-    if df_is_real is False and df_score is not None and df_score <= DF_STRONG_SPOOF:
+    # --- Hard spoof: DeepFace flag bilang spoof
+    if df_is_real is False:
+        # boolean dari DF kuat -> langsung spoof
         return {
             "is_live": False,
             "reason": "spoof_detected",
@@ -330,36 +332,51 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "df_is_real": df_is_real,
             "df_score": df_score,
             "model": "anti-spoof-mn3(+deepface)",
-            "debug": f"FAIL(df_strong_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score:.3f}"
+            "debug": f"FAIL(df_flag_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
         }
 
-    # Strong-live shortcut: kalau OpenVINO sudah sangat yakin, jangan diganggu DF yang kadang fluktuatif
+    # --- Strong-live shortcut:
+    # kalau OpenVINO sudah sangat yakin, tapi DF skornya jelek -> jangan diloloskan
     if ov_real >= 0.90:
-        # kalau DF skornya parah banget baru jangan lolos
-        if df_score is not None and df_score <= DF_STRONG_SPOOF:
+        if df_score is None:
+            # Tidak ada DF, percaya OpenVINO
             return {
-                "is_live": False,
-                "reason": "spoof_detected",
+                "is_live": True,
+                "reason": "ok",
+                "prob_real": ov_real,
+                "prob_spoof": ov_spoof,
+                "df_is_real": None,
+                "df_score": None,
+                "model": "anti-spoof-mn3",
+                "debug": f"PASS(ov_strong_live_no_df) ov_real={ov_real:.3f}"
+            }
+
+        # DF harus cukup bagus juga, baru dianggap real
+        if df_score >= DF_PASS:
+            return {
+                "is_live": True,
+                "reason": "ok",
                 "prob_real": ov_real,
                 "prob_spoof": ov_spoof,
                 "df_is_real": df_is_real,
                 "df_score": df_score,
-                "model": "anti-spoof-mn3+deepface",
-                "debug": f"FAIL(df_strong_spoof_override) ov_real={ov_real:.3f} df_score={df_score:.3f}"
+                "model": "anti-spoof-mn3(+deepface)",
+                "debug": f"PASS(ov_strong_live) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score:.3f}"
             }
 
+        # Di sini: ov_real tinggi tapi DF score rendah -> treat as spoof
         return {
-            "is_live": True,
-            "reason": "ok",
+            "is_live": False,
+            "reason": "spoof_detected",
             "prob_real": ov_real,
             "prob_spoof": ov_spoof,
             "df_is_real": df_is_real,
             "df_score": df_score,
-            "model": "anti-spoof-mn3(+deepface)",
-            "debug": f"PASS(ov_strong_live) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
+            "model": "anti-spoof-mn3+deepface",
+            "debug": f"FAIL(ov_strong_live_df_low) ov_real={ov_real:.3f} df_score={df_score:.3f}"
         }
 
-    # Pass conditions
+    # --- Pass kalau tidak masuk blok strong-live di atas
     if df_score is None:
         # No DF module available -> rely on OpenVINO only
         if ov_real >= OV_PASS:
@@ -385,7 +402,7 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "debug": f"UNCERTAIN(ov_only) ov_real={ov_real:.3f}"
         }
 
-    # DF available: treat score as bonus (jangan terlalu percaya df_is_real)
+    # DF available: kombinasi keduanya di area normal
     if (ov_real >= OV_PASS and df_score >= DF_PASS):
         return {
             "is_live": True,
@@ -411,7 +428,7 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "debug": f"PASS(df_rescue) ov_real={ov_real:.3f} df_score={df_score:.3f}"
         }
 
-    # otherwise -> uncertain (ask recapture)
+    # otherwise -> uncertain / spoof ringan (blokir juga)
     return {
         "is_live": False,
         "reason": "liveness_uncertain" if ov_real >= OV_UNCERTAIN_LOW else "spoof_detected",
@@ -462,7 +479,7 @@ def _recognize_no_liveness(image_bytes: bytes, threshold: float = DEFAULT_THRESH
     second_id: Optional[str] = None
     second_dist: float = 999.0
 
-    # ✅ hitung jarak terbaik PER ORANG (min dari semua embedding milik orang itu)
+    # hitung jarak terbaik PER ORANG (min dari semua embedding milik orang itu)
     for emp_id, data in db.items():
         name = data.get("name")
         embs = data.get("embeddings", []) or []
