@@ -29,7 +29,7 @@ DF_STRONG_SPOOF = 0.50  # score di bawah ini + flag spoof => spoof kuat
 MIN_FACE_AREA = 90 * 90
 MIN_FACE_CONF = 0.70     # relaxed dari 0.80
 MIN_BLUR_VAR = 10.0      # relaxed dari 15.0
-MIN_BRIGHT = 15.0        # relaxed dari 25.0 (toleran backlight)
+MIN_BRIGHT = 5.0         # sangat toleran untuk lowlight (evaluasi setelah CLAHE)
 MAX_BRIGHT = 250.0       # relaxed dari 240.0
 
 # Optional: enforce liveness on enrollment
@@ -261,7 +261,11 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
     else:
         face_u8 = face_np.clip(0, 255).astype(np.uint8)
 
-    # 2) Quality gate
+    # 1.5) Apply CLAHE enhancement SEBELUM quality check
+    # Ini handle lowlight/backlight agar quality check lebih akurat
+    face_enhanced = _enhance_lighting(face_u8)
+
+    # 2) Quality gate (evaluasi pada foto yang sudah di-enhance)
     fa = (meta or {}).get("facial_area", {}) or {}
     x = int(fa.get("x", 0) or 0)
     y = int(fa.get("y", 0) or 0)
@@ -269,7 +273,7 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
     h = int(fa.get("h", 0) or 0)
     conf = _safe_float((meta or {}).get("confidence", 1.0), 1.0)
 
-    qm = _quality_metrics(face_u8)
+    qm = _quality_metrics(face_enhanced)
     blur_var = qm["blur_var"]
     bright = qm["bright"]
     area = w * h
@@ -292,8 +296,8 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "debug": f"quality_low conf={conf:.2f} area={w}x{h} blur={blur_var:.1f} bright={bright:.1f}"
         }
 
-    # 3) OpenVINO multi-crop inference from bbox (stabilizer + include background)
-    # Apply CLAHE preprocessing untuk handle bad lighting
+    # 3) OpenVINO multi-crop inference from bbox
+    # Gunakan enhanced image untuk inference
     ov_scores = []
     ov_spoofs = []
 
@@ -303,14 +307,13 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             crop = img_bgr[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
-            # Apply CLAHE preprocessing untuk normalize lighting
+            # Apply CLAHE untuk normalize lighting
             crop_enhanced = _enhance_lighting(crop.astype(np.uint8))
             p_real, p_spoof = _infer_ov(crop_enhanced)
             ov_scores.append(p_real)
             ov_spoofs.append(p_spoof)
     else:
-        # Apply CLAHE ke face crop juga
-        face_enhanced = _enhance_lighting(face_u8)
+        # face_enhanced sudah dibuat di atas (sebelum quality check)
         p_real, p_spoof = _infer_ov(face_enhanced)
         ov_scores.append(p_real)
         ov_spoofs.append(p_spoof)
@@ -345,9 +348,9 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "debug": f"FAIL(ov_strong_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
         }
 
-    # --- Hard spoof: DeepFace flag bilang spoof
-    if df_is_real is False:
-        # boolean dari DF kuat -> langsung spoof
+    # --- DeepFace flag hanya dipercaya kalau OpenVINO juga uncertain/rendah
+    # Jangan reject jika OpenVINO sangat yakin real (>0.75) - proven lebih akurat
+    if df_is_real is False and ov_real <= 0.75:
         return {
             "is_live": False,
             "reason": "spoof_detected",
@@ -356,14 +359,13 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "df_is_real": df_is_real,
             "df_score": df_score,
             "model": "anti-spoof-mn3(+deepface)",
-            "debug": f"FAIL(df_flag_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
+            "debug": f"FAIL(df_flag_spoof_ov_uncertain) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
         }
 
-    # --- Strong-live shortcut:
-    # kalau OpenVINO sudah sangat yakin, tapi DF skornya jelek -> jangan diloloskan
+    # --- Strong-live: OpenVINO tinggi, tapi perlu konfirmasi dari DeepFace
     if ov_real >= 0.90:
-        if df_score is None:
-            # Tidak ada DF, percaya OpenVINO
+        # Jika tidak ada DeepFace module, percaya OpenVINO
+        if df_score is None and df_is_real is None:
             return {
                 "is_live": True,
                 "reason": "ok",
@@ -374,9 +376,24 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
                 "model": "anti-spoof-mn3",
                 "debug": f"PASS(ov_strong_live_no_df) ov_real={ov_real:.3f}"
             }
-
-        # DF harus cukup bagus juga, baru dianggap real
-        if df_score >= DF_PASS:
+        
+        # PRIORITAS: DeepFace flag False (explicit spoof) = REJECT langsung
+        if df_is_real is False:
+            return {
+                "is_live": False,
+                "reason": "spoof_detected",
+                "prob_real": ov_real,
+                "prob_spoof": ov_spoof,
+                "df_is_real": df_is_real,
+                "df_score": df_score,
+                "model": "anti-spoof-mn3(+deepface)",
+                "debug": f"FAIL(df_flag_explicit_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
+            }
+        
+        # LOLOS jika: DF flag True (explicit real) ATAU score tinggi
+        df_confirms_real = (df_is_real is True) or (df_score is not None and df_score >= DF_PASS)
+        
+        if df_confirms_real:
             return {
                 "is_live": True,
                 "reason": "ok",
@@ -385,10 +402,10 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
                 "df_is_real": df_is_real,
                 "df_score": df_score,
                 "model": "anti-spoof-mn3(+deepface)",
-                "debug": f"PASS(ov_strong_live) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score:.3f}"
+                "debug": f"PASS(ov_strong_live_df_confirm) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
             }
-
-        # Di sini: ov_real tinggi tapi DF score rendah -> treat as spoof
+        
+        # REJECT: OV tinggi tapi DF detect spoof (score rendah atau flag false)
         return {
             "is_live": False,
             "reason": "spoof_detected",
@@ -396,8 +413,8 @@ def detect_spoof(image_bytes: bytes) -> Dict[str, Any]:
             "prob_spoof": ov_spoof,
             "df_is_real": df_is_real,
             "df_score": df_score,
-            "model": "anti-spoof-mn3+deepface",
-            "debug": f"FAIL(ov_strong_live_df_low) ov_real={ov_real:.3f} df_score={df_score:.3f}"
+            "model": "anti-spoof-mn3(+deepface)",
+            "debug": f"FAIL(ov_high_df_reject) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score}"
         }
 
     # --- Pass kalau tidak masuk blok strong-live di atas
