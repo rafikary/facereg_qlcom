@@ -46,11 +46,26 @@ _OV_OUTPUT = None
 
 
 def load_liveness_model() -> None:
-    """Call once at startup. If model missing => bypass liveness."""
+    """Call once at startup. Validate environment and load models."""
     global _OV_CORE, _OV_COMPILED, _OV_OUTPUT
 
+    # Validate PyTorch for DeepFace anti-spoofing
+    try:
+        import torch
+        print(f"[LIVENESS] PyTorch version: {torch.__version__}")
+    except ImportError:
+        print("=" * 70)
+        print("❌ CRITICAL WARNING: PyTorch not installed!")
+        print("DeepFace anti-spoofing will NOT work.")
+        print("Spoof detection will be INCONSISTENT and LESS SECURE.")
+        print("")
+        print("Install with: pip install torch torchvision")
+        print("=" * 70)
+        # Continue but with warning (tidak throw error agar dev bisa test)
+
     if not os.path.exists(LIVENESS_MODEL_PATH):
-        print(f"[LIVENESS] Model not found: {LIVENESS_MODEL_PATH} (bypass)")
+        print(f"[LIVENESS] ⚠️  OpenVINO model not found: {LIVENESS_MODEL_PATH}")
+        print("[LIVENESS] Anti-spoof detection will be DISABLED (INSECURE)")
         _OV_CORE = None
         _OV_COMPILED = None
         _OV_OUTPUT = None
@@ -60,7 +75,7 @@ def load_liveness_model() -> None:
     model = _OV_CORE.read_model(LIVENESS_MODEL_PATH)
     _OV_COMPILED = _OV_CORE.compile_model(model, "CPU")
     _OV_OUTPUT = _OV_COMPILED.output(0)
-    print(f"[LIVENESS] Loaded: {LIVENESS_MODEL_PATH}")
+    print(f"[LIVENESS] ✅ OpenVINO model loaded: {LIVENESS_MODEL_PATH}")
 
 
 # ================== UTIL DB ==================
