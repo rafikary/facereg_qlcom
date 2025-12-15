@@ -15,3 +15,6 @@ flask_cors
 fastapi
 uvicorn[standard]
 python-multipart
+torch
+torchvision
+openvino
