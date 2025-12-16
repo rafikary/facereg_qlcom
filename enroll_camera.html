@@ -139,6 +139,30 @@
       font-weight: 500;
     }
 
+    .btn-mode {
+      padding: 10px;
+      background: #dfe6e9;
+      border: 2px solid #dfe6e9;
+      border-radius: 10px;
+      color: #636e72;
+      font-size: 14px;
+      cursor: pointer;
+      transition: 0.2s;
+      font-weight: 500;
+    }
+
+    .btn-mode.active {
+      background: #0984e3;
+      border-color: #0984e3;
+      color: white;
+    }
+
+    .btn-mode:hover {
+      background: #74b9ff;
+      border-color: #74b9ff;
+      color: white;
+    }
+
     .muted { color:#636e72; font-size:12px; }
   </style>
 </head>
@@ -154,11 +178,29 @@
     <label>Nama</label>
     <input id="empName" placeholder="contoh: Rafika">
 
-    <video id="video" autoplay playsinline></video>
+    <!-- Mode Switch -->
+    <div style="margin: 16px 0; text-align: center;">
+      <button id="modeCamera" class="btn-mode active" style="width: 48%; margin-right: 2%;">📷 Kamera</button>
+      <button id="modeUpload" class="btn-mode" style="width: 48%;">📁 Upload Foto</button>
+    </div>
 
-    <div id="instruction"></div>
+    <!-- Camera Mode -->
+    <div id="cameraMode">
+      <video id="video" autoplay playsinline></video>
+      <div id="instruction"></div>
+      <button id="captureBtn">Ambil Foto</button>
+    </div>
 
-    <button id="captureBtn">Ambil Foto</button>
+    <!-- Upload Mode -->
+    <div id="uploadMode" style="display:none;">
+      <div style="border: 2px dashed #dfe6e9; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 12px;">
+        <input type="file" id="fileInput" accept="image/*" style="display:none;">
+        <button id="uploadBtn" style="background: #00b894;">Pilih Foto</button>
+        <div class="muted" style="margin-top: 8px;">Format: JPG/PNG, Max 5MB</div>
+      </div>
+      <div id="uploadInstruction" style="background: #dfe6e9; padding: 10px; border-radius: 10px; margin-bottom: 10px; font-size: 14px; text-align: center; font-weight: 500;"></div>
+    </div>
+
     <button id="finishBtn" class="btn-secondary" disabled>Selesai Pendaftaran</button>
 
     <div id="statusBadge" style="display:none;"></div>
@@ -191,17 +233,72 @@
 
     let currentStep = 0;
     let successCount = 0;
+    let currentMode = 'camera'; // 'camera' or 'upload'
 
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
     const captureBtn = document.getElementById("captureBtn");
     const finishBtn = document.getElementById("finishBtn");
     const instruction = document.getElementById("instruction");
+    const uploadInstruction = document.getElementById("uploadInstruction");
     const logBox = document.getElementById("logBox");
     const statusBadge = document.getElementById("statusBadge");
+    const modeCamera = document.getElementById("modeCamera");
+    const modeUpload = document.getElementById("modeUpload");
+    const cameraMode = document.getElementById("cameraMode");
+    const uploadMode = document.getElementById("uploadMode");
+    const uploadBtn = document.getElementById("uploadBtn");
+    const fileInput = document.getElementById("fileInput");
 
     instruction.textContent = steps[currentStep];
+    uploadInstruction.textContent = steps[currentStep];
 
+    // ===================== MODE SWITCH =====================
+    modeCamera.addEventListener("click", () => {
+      currentMode = 'camera';
+      modeCamera.classList.add('active');
+      modeUpload.classList.remove('active');
+      cameraMode.style.display = 'block';
+      uploadMode.style.display = 'none';
+      startCamera();
+    });
+
+    modeUpload.addEventListener("click", () => {
+      currentMode = 'upload';
+      modeUpload.classList.add('active');
+      modeCamera.classList.remove('active');
+      uploadMode.style.display = 'block';
+      cameraMode.style.display = 'none';
+      stopCameraStream();
+    });
+
+    uploadBtn.addEventListener("click", () => {
+      fileInput.click();
+    });
+
+    fileInput.addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      // Validasi ukuran file (max 5MB)
+      if (file.size > 5 * 1024 * 1024) {
+        alert("Ukuran file terlalu besar! Maksimal 5MB.");
+        fileInput.value = '';
+        return;
+      }
+
+      // Validasi tipe file
+      if (!file.type.startsWith('image/')) {
+        alert("File harus berupa gambar (JPG/PNG)!");
+        fileInput.value = '';
+        return;
+      }
+
+      await submitPhotoFromFile(file);
+      fileInput.value = ''; // Reset input
+    });
+
+    // ===================== CAMERA =====================
     async function startCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -214,6 +311,14 @@
         video.srcObject = stream;
       } catch (err) {
         alert("Gagal akses kamera: " + err.message);
+      }
+    }
+
+    function stopCameraStream() {
+      if (video.srcObject) {
+        const tracks = video.srcObject.getTracks();
+        tracks.forEach(track => track.stop());
+        video.srcObject = null;
       }
     }
 
@@ -334,6 +439,77 @@
       }
     }
 
+    // ===================== SUBMIT PHOTO =====================
+    async function submitPhotoFromFile(file) {
+      const empId = document.getElementById("empId").value.trim();
+      const empName = document.getElementById("empName").value.trim();
+
+      if (!empId || !empName) {
+        alert("Isi dulu ID Karyawan & Nama");
+        return;
+      }
+
+      uploadBtn.disabled = true;
+      uploadBtn.textContent = "Mengirim...";
+
+      try {
+        const formData = new FormData();
+        formData.append("employee_id", empId);
+        formData.append("name", empName);
+        formData.append("image", file, file.name);
+
+        const res = await fetch(`${API_BASE}/register`, {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          addLogFailure(
+            currentStep,
+            "Server mengembalikan error",
+            errData.detail || JSON.stringify(errData)
+          );
+          showWarning("Foto belum berhasil tersimpan. Ulangi step ini.");
+          return;
+        }
+
+        const data = await res.json();
+        if (data.status === "success" && data.data) {
+          const info = data.data;
+          successCount++;
+
+          if (logBox.textContent.startsWith("Belum ada foto")) logBox.textContent = "";
+
+          logBox.textContent +=
+            `Step ${currentStep + 1} selesai ✅\n` +
+            `• ID     : ${info.employee_id}\n` +
+            `• Nama   : ${info.name}\n` +
+            `• Total foto tersimpan: ${info.num_embeddings}\n` +
+            `• File   : ${file.name}\n\n`;
+
+          currentStep++;
+          if (currentStep < steps.length) {
+            uploadInstruction.textContent = steps[currentStep];
+            clearStatus();
+          } else {
+            uploadInstruction.textContent = "Semua pose sudah dicoba. Jika data sudah sesuai, klik 'Selesai Pendaftaran'.";
+            showDoneOrWarning();
+          }
+        } else {
+          addLogFailure(currentStep, "Response tidak sesuai format", JSON.stringify(data));
+          showWarning("Foto tidak berhasil diproses. Ulangi step ini.");
+        }
+
+      } catch (err) {
+        addLogFailure(currentStep, "Error jaringan / fetch", err.message);
+        showWarning("Terjadi error jaringan. Ulangi step ini.");
+      } finally {
+        uploadBtn.disabled = false;
+        uploadBtn.textContent = "Pilih Foto";
+      }
+    }
+
     // ===================== ACTIONS =====================
     captureBtn.addEventListener("click", async () => {
       const empId = document.getElementById("empId").value.trim();
@@ -411,10 +587,21 @@
 
     finishBtn.addEventListener("click", () => {
       if (successCount >= MIN_SUCCESS) {
-        alert("Pendaftaran wajah selesai. Anda akan diarahkan ke halaman pengecekan wajah.");
-        setTimeout(() => {
+        const empName = document.getElementById("empName").value.trim();
+        if (confirm(`Pendaftaran wajah untuk ${empName} selesai. Daftar karyawan lain?`)) {
+          // Reset untuk enrollment berikutnya
+          currentStep = 0;
+          successCount = 0;
+          document.getElementById("empId").value = '';
+          document.getElementById("empName").value = '';
+          logBox.textContent = "Belum ada foto diambil.";
+          instruction.textContent = steps[0];
+          uploadInstruction.textContent = steps[0];
+          finishBtn.disabled = true;
+          clearStatus();
+        } else {
           window.location.href = "camera_test.html";
-        }, 700);
+        }
       } else {
         alert("Belum memenuhi jumlah foto yang berhasil. Ulangi pengambilan sampai minimal berhasil.");
       }

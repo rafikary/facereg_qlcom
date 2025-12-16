@@ -442,8 +442,12 @@
         const r = String(info.reason || info.liveness_reason || "spoof_detected");
         const msgMap = {
           spoof_detected: {
-            title: "⛔ Ditolak (indikasi spoof)",
+            title: "🚫 SPOOF TERDETEKSI",
             detail: "Terindikasi bukan wajah live. Silakan ulang dengan wajah asli di depan kamera."
+          },
+          screen_photo_detected: {
+            title: "🚫 FOTO LAYAR TERDETEKSI",
+            detail: "Sistem mendeteksi foto dari layar HP/monitor (moiré pattern). Gunakan wajah asli, bukan foto!"
           },
           liveness_uncertain: {
             title: "⚠️ Liveness belum yakin",
