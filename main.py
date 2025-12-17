@@ -36,7 +36,7 @@ def root():
         "status": "running",
         "message": "QLCOM Face Recognition API is active",
         "endpoints": {
-            "register": "/register",
+            "register": "/register (support 1 or multiple photos)",
             "recognize": "/recognize",
             "recognize_multi": "/recognize_multi",
             "list_users": "/users",
@@ -49,12 +49,39 @@ def root():
 async def register(
     employee_id: str = Form(...),
     name: str = Form(...),
-    image: UploadFile = File(...),
+    images: List[UploadFile] = File(...),
 ):
+    """
+    Register wajah dengan 1 foto atau multiple photos sekaligus.
+    - Upload 1 foto: pilih 1 file
+    - Upload banyak foto: pilih multiple files (lebih akurat)
+    """
     try:
-        img_bytes = await image.read()
-        result = engine.register_face(employee_id, name, img_bytes)
-        return {"status": "success", "data": result}
+        results = []
+        for idx, image in enumerate(images, 1):
+            img_bytes = await image.read()
+            result = engine.register_face(employee_id, name, img_bytes)
+            results.append({
+                "photo_index": idx,
+                "filename": image.filename,
+                "num_embeddings": result.get("num_embeddings")
+            })
+        
+        # Kalau cuma 1 foto, return format simple
+        if len(results) == 1:
+            return {"status": "success", "data": results[0]["num_embeddings"]}
+        
+        # Kalau multiple, return detail lengkap
+        return {
+            "status": "success",
+            "data": {
+                "employee_id": employee_id,
+                "name": name,
+                "total_photos_registered": len(results),
+                "total_embeddings": results[-1]["num_embeddings"],
+                "details": results
+            }
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
