@@ -26,11 +26,18 @@ DF_STRONG_SPOOF = 0.30
 # Quality thresholds
 MIN_FACE_AREA = 90 * 90
 MIN_FACE_CONF = 0.70
-MIN_BLUR_VAR = 10.0
+MIN_BLUR_VAR = 10.0  # Untuk recognize (ketat)
+MIN_BLUR_VAR_REGISTER = 7.0  # Untuk register (lebih lenient - foto dari device beragam)
 MIN_BRIGHT = 5.0
 MAX_BRIGHT = 250.0
 
-ENROLL_REQUIRE_LIVENESS = True
+# Image size limits (untuk optimasi processing speed dan memory)
+MAX_IMAGE_WIDTH = 1280
+MAX_IMAGE_HEIGHT = 720
+JPEG_QUALITY_HIGH = 95  # Untuk register
+JPEG_QUALITY_NORMAL = 85  # Untuk recognize
+
+ENROLL_REQUIRE_LIVENESS = False  # Disabled untuk registrasi cepat (liveness tetap aktif di recognize)
 
 # Face matching configuration
 DEFAULT_THRESHOLD = 3.5
@@ -90,6 +97,57 @@ def bytes_to_bgr_image(image_bytes: bytes) -> np.ndarray:
     if img is None:
         raise ValueError("Gagal membaca gambar. Pastikan jpg/png/jpeg valid.")
     return img
+
+
+def _resize_if_large(img: np.ndarray, max_width: int = MAX_IMAGE_WIDTH, max_height: int = MAX_IMAGE_HEIGHT) -> np.ndarray:
+    """
+    Resize image jika terlalu besar (untuk optimasi processing speed dan memory).
+    Maintain aspect ratio.
+    """
+    h, w = img.shape[:2]
+    
+    # Kalau sudah di bawah limit, return as-is
+    if w <= max_width and h <= max_height:
+        return img
+    
+    # Hitung scaling factor (pilih yang lebih kecil)
+    scale_w = max_width / w
+    scale_h = max_height / h
+    scale = min(scale_w, scale_h)
+    
+    # Resize dengan maintain aspect ratio
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    print(f"[RESIZE] Image resized from {w}x{h} to {new_w}x{new_h} (scale={scale:.2f})")
+    
+    return resized
+
+
+def _compress_image(img: np.ndarray, quality: int = JPEG_QUALITY_NORMAL, max_size_kb: int = 500) -> bytes:
+    """
+    Compress image to JPEG dengan quality control dan max file size.
+    Akan otomatis turunkan quality jika file masih terlalu besar.
+    
+    Returns: compressed image bytes
+    """
+    # Coba dengan quality awal
+    encode_param = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    _, buffer = cv2.imencode('.jpg', img, encode_param)
+    img_bytes = buffer.tobytes()
+    size_kb = len(img_bytes) / 1024
+    
+    # Kalau masih terlalu besar, turunkan quality secara iteratif
+    while size_kb > max_size_kb and quality > 60:
+        quality -= 5
+        encode_param = [cv2.IMWRITE_JPEG_QUALITY, quality]
+        _, buffer = cv2.imencode('.jpg', img, encode_param)
+        img_bytes = buffer.tobytes()
+        size_kb = len(img_bytes) / 1024
+    
+    print(f"[COMPRESS] Image compressed to {size_kb:.1f} KB (quality={quality})")
+    return img_bytes
 
 
 def _safe_float(x, default=None):
@@ -258,7 +316,7 @@ def _quality_metrics(face_bgr_u8: np.ndarray) -> Dict[str, float]:
 
 # Liveness detection
 
-def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False) -> Dict[str, Any]:
+def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False, lenient_quality: bool = False) -> Dict[str, Any]:
     """
     Returns:
       {
@@ -272,6 +330,7 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False) -> Dict
     
     Args:
         skip_screen_detector: If True, skip moiré pattern detection (for enrollment with pre-captured photos)
+        lenient_quality: If True, use lower blur threshold (for enrollment with varied devices)
     """
     # Lazy load (optional)
     if _OV_COMPILED is None and os.path.exists(LIVENESS_MODEL_PATH):
@@ -302,6 +361,7 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False) -> Dict
     df_score = None
 
     try:
+        from deepface import DeepFace  # Lazy import
         faces = DeepFace.extract_faces(
             img_path=img_bgr,
             detector_backend=DETECTOR_BACKEND,
@@ -318,6 +378,7 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False) -> Dict
     except Exception as e:
         # Fallback to OpenVINO only
         try:
+            from deepface import DeepFace  # Lazy import
             faces = DeepFace.extract_faces(
                 img_path=img_bgr,
                 detector_backend=DETECTOR_BACKEND,
@@ -391,9 +452,12 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False) -> Dict
     bright = qm["bright"]
     area = w * h
 
+    # Gunakan threshold blur yang tepat (lenient untuk register, ketat untuk recognize)
+    blur_threshold = MIN_BLUR_VAR_REGISTER if lenient_quality else MIN_BLUR_VAR
+    
     low_conf = conf is not None and conf < MIN_FACE_CONF
     too_small = area < MIN_FACE_AREA
-    too_blur = blur_var < MIN_BLUR_VAR
+    too_blur = blur_var < blur_threshold
     too_dark = bright < MIN_BRIGHT
     too_bright = bright > MAX_BRIGHT
 
@@ -406,7 +470,7 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False) -> Dict
             "df_is_real": df_is_real,
             "df_score": df_score,
             "model": "anti-spoof-mn3(+deepface)",
-            "debug": f"quality_low conf={conf:.2f} area={w}x{h} blur={blur_var:.1f} bright={bright:.1f}"
+            "debug": f"quality_low conf={conf:.2f} area={w}x{h} blur={blur_var:.1f} (need>={blur_threshold:.1f}) bright={bright:.1f}"
         }
 
     # 3) OpenVINO multi-crop inference from bbox
@@ -550,6 +614,7 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False) -> Dict
 # ================== ARCFace Embedding ==================
 
 def get_arcface_embedding(image_bytes: bytes) -> np.ndarray:
+    from deepface import DeepFace  # Lazy import
     img = bytes_to_bgr_image(image_bytes)
     try:
         reps = DeepFace.represent(
@@ -644,9 +709,16 @@ def _recognize_no_liveness(image_bytes: bytes, threshold: float = DEFAULT_THRESH
 # Face enrollment
 
 def register_face(employee_id: str, name: str, image_bytes: bytes) -> Dict[str, Any]:
+    # 1. Resize image jika terlalu besar (optimasi speed & memory)
+    img = bytes_to_bgr_image(image_bytes)
+    img_resized = _resize_if_large(img)
+    
+    # 2. Compress untuk optimasi file size (max 500KB)
+    image_bytes = _compress_image(img_resized, quality=JPEG_QUALITY_HIGH, max_size_kb=500)
+    
     if ENROLL_REQUIRE_LIVENESS:
-        # Skip screen detector for enrollment (uploaded photos may have compression artifacts)
-        live = detect_spoof(image_bytes, skip_screen_detector=True)
+        # Skip screen detector & use lenient quality untuk enrollment (device beragam)
+        live = detect_spoof(image_bytes, skip_screen_detector=True, lenient_quality=True)
         if not live["is_live"]:
             raise ValueError(f"Enrollment ditolak ({live['reason']}): {live.get('debug')}")
 
@@ -667,7 +739,15 @@ def register_face(employee_id: str, name: str, image_bytes: bytes) -> Dict[str, 
 # Single-frame recognition
 
 def recognize_face(image_bytes: bytes, threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
-    live = detect_spoof(image_bytes)
+    # 1. Resize image jika terlalu besar (optimasi speed & memory)
+    img = bytes_to_bgr_image(image_bytes)
+    img_resized = _resize_if_large(img)
+    
+    # 2. Compress untuk optimasi file size
+    image_bytes = _compress_image(img_resized, quality=JPEG_QUALITY_NORMAL, max_size_kb=400)
+    
+    # 3. Liveness detection (use strict blur threshold untuk recognize)
+    live = detect_spoof(image_bytes, lenient_quality=False)
 
     if not live["is_live"]:
         return {
