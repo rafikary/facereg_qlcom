@@ -1,5 +1,5 @@
 tensorflow==2.12.0
-deepface==0.0.79
+deepface>=0.0.88
 opencv-python
 mtcnn
 retina-face

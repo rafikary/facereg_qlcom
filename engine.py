@@ -699,42 +699,127 @@ def register_face(employee_id: str, name: str, image_bytes: bytes) -> Dict[str, 
 # Single-frame recognition
 
 def recognize_face(image_bytes: bytes, threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
-    # 1. Resize image jika terlalu besar (optimasi speed & memory)
     img = bytes_to_bgr_image(image_bytes)
     img_resized = _resize_if_large(img)
-    
-    # 2. Compress untuk optimasi file size
     image_bytes = _compress_image(img_resized, quality=JPEG_QUALITY_NORMAL, max_size_kb=400)
     
-    # 3. Liveness detection (use STRICT blur threshold for recognize)
     live = detect_spoof(image_bytes, lenient_quality=False)
-
-    if not live["is_live"]:
+    live_reason = live.get("reason", "")
+    prob_real = live.get("prob_real")
+    is_live = live.get("is_live", False)
+    
+    # Quality gate (soft)
+    if live_reason == "quality_low":
+        return {
+            "match": False,
+            "ready": False,
+            "reason": "not_ready",
+            "detail": "quality_low",
+            "liveness_ok": None,
+        }
+    
+    # VETO ABSOLUT: spoof_detected SELALU reject tanpa syarat
+    if live_reason == "spoof_detected":
         return {
             "match": False,
             "liveness_ok": False,
-            "liveness_reason": live.get("reason"),
-            "liveness_prob_real": live.get("prob_real"),
-            "liveness_prob_spoof": live.get("prob_spoof"),
-            "liveness_df_is_real": live.get("df_is_real"),
-            "liveness_df_score": live.get("df_score"),
-            "liveness_model": live.get("model"),
-            "reason": live.get("reason", "spoof_detected"),
-            "debug_liveness": live.get("debug"),
+            "reason": "spoof_detected",
+            "liveness_prob_real": prob_real,
+            "liveness_reason": live_reason,
         }
-
+    
+    # Identity check
     rec = _recognize_no_liveness(image_bytes, threshold=threshold)
-    rec.update({
-        "liveness_ok": True,
-        "liveness_reason": live.get("reason"),
-        "liveness_prob_real": live.get("prob_real"),
-        "liveness_prob_spoof": live.get("prob_spoof"),
-        "liveness_df_is_real": live.get("df_is_real"),
-        "liveness_df_score": live.get("df_score"),
-        "liveness_model": live.get("model"),
-        "debug_liveness": live.get("debug"),
-    })
-    return rec
+    
+    # Evaluasi kekuatan identitas
+    identity_strong = False
+    if rec.get("match"):
+        dist = rec.get("distance", 999)
+        margin = rec.get("margin", 0)
+        if dist < (threshold * 0.7) and margin >= MATCH_MARGIN:
+            identity_strong = True
+    
+    # Decision logic
+    if rec.get("match"):
+        # prob_real None = tidak ada data → NOT_READY
+        if prob_real is None:
+            return {
+                "match": False,
+                "ready": False,
+                "reason": "not_ready",
+                "detail": "liveness_unavailable",
+                "liveness_ok": None,
+            }
+        
+        # is_live WAJIB True untuk ACCEPT
+        if not is_live:
+            return {
+                "match": False,
+                "ready": False,
+                "reason": "not_ready",
+                "detail": "liveness_not_confirmed",
+                "liveness_ok": None,
+            }
+        
+        # reason HARUS "ok" untuk ACCEPT
+        if live_reason != "ok":
+            return {
+                "match": False,
+                "ready": False,
+                "reason": "not_ready",
+                "detail": f"liveness_reason_{live_reason}",
+                "liveness_ok": None,
+            }
+        
+        # Threshold liveness berjenjang
+        if identity_strong:
+            if prob_real >= 0.80:
+                rec["liveness_ok"] = True
+                rec["liveness_prob_real"] = prob_real
+                rec["reason"] = "ok"
+                return rec
+            elif prob_real >= 0.65:
+                return {
+                    "match": False,
+                    "ready": False,
+                    "reason": "not_ready",
+                    "detail": "liveness_borderline",
+                    "liveness_ok": None,
+                }
+            else:
+                rec["match"] = False
+                rec["liveness_ok"] = False
+                rec["reason"] = "spoof_detected"
+                return rec
+        else:
+            if prob_real >= 0.85:
+                rec["liveness_ok"] = True
+                rec["liveness_prob_real"] = prob_real
+                rec["reason"] = "ok"
+                return rec
+            elif prob_real >= 0.65:
+                return {
+                    "match": False,
+                    "ready": False,
+                    "reason": "not_ready",
+                    "detail": "confidence_low",
+                    "liveness_ok": None,
+                }
+            else:
+                rec["match"] = False
+                rec["liveness_ok"] = False
+                rec["reason"] = "spoof_detected"
+                return rec
+    else:
+        # Tidak match
+        if live_reason == "spoof_detected":
+            rec["liveness_ok"] = False
+            rec["reason"] = "spoof_detected"
+            return rec
+        else:
+            rec["liveness_ok"] = None
+            rec["reason"] = "no_match"
+            return rec
 
 
 # Multi-frame recognition
