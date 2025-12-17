@@ -19,28 +19,28 @@ OV_UNCERTAIN_LOW = 0.70
 OV_STRONG_SPOOF = 0.50
 
 # DeepFace anti-spoof thresholds
-DF_PASS = 0.50  # Lowered - DF often gives low scores for real faces in poor lighting
+DF_PASS = 0.80
 DF_STRONG_LIVE = 0.90
 DF_STRONG_SPOOF = 0.30
 
 # Quality thresholds
 MIN_FACE_AREA = 90 * 90
 MIN_FACE_CONF = 0.70
-MIN_BLUR_VAR = 10.0  # Untuk recognize (ketat)
-MIN_BLUR_VAR_REGISTER = 7.0  # Untuk register (lebih lenient - foto dari device beragam)
+MIN_BLUR_VAR = 10.0
+MIN_BLUR_VAR_REGISTER = 7.0
 MIN_BRIGHT = 5.0
 MAX_BRIGHT = 250.0
 
-# Image size limits (untuk optimasi processing speed dan memory)
+# Image size limits
 MAX_IMAGE_WIDTH = 1280
 MAX_IMAGE_HEIGHT = 720
-JPEG_QUALITY_HIGH = 95  # Untuk register
-JPEG_QUALITY_NORMAL = 85  # Untuk recognize
+JPEG_QUALITY_HIGH = 95
+JPEG_QUALITY_NORMAL = 85
 
-ENROLL_REQUIRE_LIVENESS = False  # Disabled untuk registrasi cepat (liveness tetap aktif di recognize)
+ENROLL_REQUIRE_LIVENESS = False
 
 # Face matching configuration
-DEFAULT_THRESHOLD = 3.5
+DEFAULT_THRESHOLD = 3.6
 MATCH_MARGIN = 0.20
 
 # OpenVINO runtime objects
@@ -126,12 +126,6 @@ def _resize_if_large(img: np.ndarray, max_width: int = MAX_IMAGE_WIDTH, max_heig
 
 
 def _compress_image(img: np.ndarray, quality: int = JPEG_QUALITY_NORMAL, max_size_kb: int = 500) -> bytes:
-    """
-    Compress image to JPEG dengan quality control dan max file size.
-    Akan otomatis turunkan quality jika file masih terlalu besar.
-    
-    Returns: compressed image bytes
-    """
     # Coba dengan quality awal
     encode_param = [cv2.IMWRITE_JPEG_QUALITY, quality]
     _, buffer = cv2.imencode('.jpg', img, encode_param)
@@ -158,7 +152,6 @@ def _safe_float(x, default=None):
 
 
 def _expand_bbox(x: int, y: int, w: int, h: int, pct: int, W: int, H: int) -> Tuple[int, int, int, int]:
-    """Expand bounding box by percentage while staying within image bounds."""
     dx = int((w * pct / 100.0) / 2.0)
     dy = int((h * pct / 100.0) / 2.0)
     x1 = max(0, x - dx)
@@ -169,7 +162,6 @@ def _expand_bbox(x: int, y: int, w: int, h: int, pct: int, W: int, H: int) -> Tu
 
 
 def _preprocess_ov(face_bgr_u8: np.ndarray) -> np.ndarray:
-    """Preprocess face image for OpenVINO model (128x128 NCHW format)."""
     face = cv2.resize(face_bgr_u8, (128, 128), interpolation=cv2.INTER_AREA).astype(np.float32)
 
     # Model-specific normalization parameters
@@ -182,7 +174,6 @@ def _preprocess_ov(face_bgr_u8: np.ndarray) -> np.ndarray:
 
 
 def _infer_ov(face_bgr_u8: np.ndarray) -> Tuple[float, float]:
-    """Run OpenVINO anti-spoof inference. Returns (prob_real, prob_spoof)."""
     inp = _preprocess_ov(face_bgr_u8)
     out = _OV_COMPILED([inp])[_OV_OUTPUT]
     out = np.array(out).reshape(2)
@@ -198,14 +189,6 @@ def _infer_ov(face_bgr_u8: np.ndarray) -> Tuple[float, float]:
 
 
 def _detect_screen_photo(face_bgr_u8: np.ndarray) -> Tuple[bool, float, str]:
-    """
-    Detect screen photo attacks using:
-    - Moiré pattern analysis (FFT)
-    - Color cast detection
-    - Edge sharpness evaluation
-    
-    Returns: (is_screen_photo, confidence, reason)
-    """
     try:
         gray = cv2.cvtColor(face_bgr_u8, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
@@ -317,21 +300,6 @@ def _quality_metrics(face_bgr_u8: np.ndarray) -> Dict[str, float]:
 # Liveness detection
 
 def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False, lenient_quality: bool = False) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        is_live: bool,
-        reason: ok|spoof_detected|liveness_uncertain|quality_low|bypass,
-        prob_real: float|None, prob_spoof: float|None,  (OpenVINO mean)
-        df_is_real: bool|None, df_score: float|None,
-        model: str,
-        debug: str
-      }
-    
-    Args:
-        skip_screen_detector: If True, skip moiré pattern detection (for enrollment with pre-captured photos)
-        lenient_quality: If True, use lower blur threshold (for enrollment with varied devices)
-    """
     # Lazy load (optional)
     if _OV_COMPILED is None and os.path.exists(LIVENESS_MODEL_PATH):
         try:
@@ -420,21 +388,7 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False, lenient
     else:
         face_u8 = face_np.clip(0, 255).astype(np.uint8)
 
-    # Screen photo detection - DISABLED (too many false positives on real webcam photos)
-    # Rely on OpenVINO + DeepFace which are more reliable
-    # if not skip_screen_detector:
-    #     is_screen, screen_conf, screen_reason = _detect_screen_photo(face_u8)
-    #     if is_screen and screen_conf > 0.6:
-    #         return {
-    #             "is_live": False,
-    #             "reason": "screen_photo_detected",
-    #             "prob_real": 0.0,
-    #             "prob_spoof": 1.0,
-    #             "df_is_real": False,
-    #             "df_score": 0.0,
-    #             "model": "screen_detector",
-    #             "debug": f"Screen photo detected: {screen_reason} (conf={screen_conf:.2f})"
-    #         }
+
 
     # Apply CLAHE for lighting normalization
     face_enhanced = _enhance_lighting(face_u8)
@@ -509,7 +463,7 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False, lenient
     ov_spoof = float(np.mean(ov_spoofs))
 
     # Liveness decision logic
-
+    
     # Strong spoof detection
     if ov_real <= OV_STRONG_SPOOF:
         return {
@@ -538,10 +492,9 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False, lenient
 
     # OpenVINO MUST be >= 0.90 (primary filter)
     if ov_real >= OV_PASS:
-        # OpenVINO passes, now check DeepFace (if available)
+        # DeepFace validation (primary decision)
         if df_score is not None:
-            # Priority: Trust OpenVINO highly (it's more accurate)
-            # Only reject if DF explicitly flags as spoof (df_is_real = False)
+            # Rule 1: DF explicitly flags spoof → ALWAYS REJECT
             if df_is_real == False:
                 return {
                     "is_live": False,
@@ -551,18 +504,11 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False, lenient
                     "df_is_real": df_is_real,
                     "df_score": df_score,
                     "model": "anti-spoof-mn3+deepface",
-                    "debug": f"FAIL(df_explicit_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score:.3f}"
+                    "debug": f"FAIL(df_flag_spoof) ov_real={ov_real:.3f} df_is_real={df_is_real} df_score={df_score:.3f}"
                 }
             
-            # DF score check (relaxed if OV is very confident)
-            if ov_real >= 0.98:
-                # OV super confident → allow lower DF score
-                df_threshold = 0.30
-            else:
-                # OV confident but not super → use normal DF threshold
-                df_threshold = DF_PASS
-            
-            if df_score >= df_threshold:
+            # Rule 2: DF score >= DF_PASS (0.55) → PASS
+            if df_score >= DF_PASS:
                 return {
                     "is_live": True,
                     "reason": "ok",
@@ -571,10 +517,24 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False, lenient
                     "df_is_real": df_is_real,
                     "df_score": df_score,
                     "model": "anti-spoof-mn3+deepface",
-                    "debug": f"PASS(both) ov_real={ov_real:.3f} df_score={df_score:.3f} (threshold={df_threshold})"
+                    "debug": f"PASS(both_pass) ov_real={ov_real:.3f} df_score={df_score:.3f}"
                 }
+            
+            # Rule 3: DF flag True + score >= 0.45 → PASS
+            elif df_is_real == True and df_score >= 0.45:
+                return {
+                    "is_live": True,
+                    "reason": "ok",
+                    "prob_real": ov_real,
+                    "prob_spoof": ov_spoof,
+                    "df_is_real": df_is_real,
+                    "df_score": df_score,
+                    "model": "anti-spoof-mn3+deepface",
+                    "debug": f"PASS(df_flag_real) ov_real={ov_real:.3f} df_score={df_score:.3f} df_is_real=True"
+                }
+            
+            # Rule 4: Else → REJECT (score too low or uncertain)
             else:
-                # DF score too low
                 return {
                     "is_live": False,
                     "reason": "spoof_detected",
@@ -583,7 +543,7 @@ def detect_spoof(image_bytes: bytes, skip_screen_detector: bool = False, lenient
                     "df_is_real": df_is_real,
                     "df_score": df_score,
                     "model": "anti-spoof-mn3+deepface",
-                    "debug": f"FAIL(df_low_score) ov_real={ov_real:.3f} df_score={df_score:.3f} (need>={df_threshold})"
+                    "debug": f"FAIL(df_low_score) ov_real={ov_real:.3f} df_score={df_score:.3f} (need>={DF_PASS})"
                 }
         
         # No DF available, trust OpenVINO alone
@@ -746,7 +706,7 @@ def recognize_face(image_bytes: bytes, threshold: float = DEFAULT_THRESHOLD) -> 
     # 2. Compress untuk optimasi file size
     image_bytes = _compress_image(img_resized, quality=JPEG_QUALITY_NORMAL, max_size_kb=400)
     
-    # 3. Liveness detection (use strict blur threshold untuk recognize)
+    # 3. Liveness detection (use STRICT blur threshold for recognize)
     live = detect_spoof(image_bytes, lenient_quality=False)
 
     if not live["is_live"]:
@@ -780,12 +740,6 @@ def recognize_face(image_bytes: bytes, threshold: float = DEFAULT_THRESHOLD) -> 
 # Multi-frame recognition
 
 def recognize_face_multi(images_bytes: List[bytes], threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
-    """
-    Vote across N frames:
-    - If >= ceil(N*0.6) frames pass liveness => accept, then recognize using best liveness frame.
-    - Else if any strong spoof => spoof_detected
-    - Else => liveness_uncertain
-    """
     if not images_bytes:
         return {"match": False, "liveness_ok": False, "reason": "quality_low", "debug_liveness": "no images"}
 
